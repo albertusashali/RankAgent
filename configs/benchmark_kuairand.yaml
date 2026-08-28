@@ -1,0 +1,55 @@
+# KuaiRand Benchmark Configuration
+benchmark_name: "KuaiRand-Pure"
+domain: "recommender_ranking"
+
+data:
+  train_split:
+    start_date: "20220408"
+    end_date: "20220421"
+    expected_rows: 1141112
+  val_split:
+    start_date: "20220422"
+    end_date: "20220428"
+    expected_rows: 124909
+  test_split:
+    start_date: "20220429"
+    end_date: "20220508"
+    expected_rows: 170588
+
+signals:
+  target_label: "long_view"
+  auxiliary_signals:
+    - "click"
+    - "like"
+    - "follow"
+    - "comment"
+    - "forward"
+    - "play_time"
+    - "is_profile_enter"
+
+evaluation:
+  metrics:
+    - "GAUC"
+    - "nDCG@5"
+  primary_metric: "mean_gauc_ndcg5"
+  gauc_min_positives: 1
+  ndcg_zero_pos_score: 0.0
+  ndcg_gain_formula: "2^rel - 1"
+
+convergence:
+  epsilon: 0.002
+  patience_iterations: 3
+  max_iterations: 50
+  max_wall_clock_seconds: 21600 # 6 hours
+
+baseline_reference:
+  model: "Factorization Machine (k=16)"
+  validation:
+    gauc: 0.6674
+    ndcg5: 0.5357
+    primary: 0.6016
+  hidden_test:
+    gauc: 0.6610
+    ndcg5: 0.5282
+    primary: 0.5946
+

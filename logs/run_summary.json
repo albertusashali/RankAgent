@@ -1,0 +1,102 @@
+{
+  "run_id": "rankagent-1787916644",
+  "total_iterations": 4,
+  "iterations": [
+    {
+      "iteration_id": 0,
+      "parent_node_id": null,
+      "node_id": 0,
+      "stage": "Baseline Reproduction",
+      "hypothesis": "Stand up official Factorization Machine baseline on KuaiRand-Pure.",
+      "target_file": "pipeline/models.py",
+      "code_diff": "Baseline reference code.",
+      "status": "ACCEPTED",
+      "metrics": {
+        "gauc": 0.6664,
+        "ndcg_5": 0.536,
+        "primary_score": 0.6012,
+        "delta_from_baseline": -0.00040000000000006697,
+        "is_converged": false,
+        "raw_stdout": "y 0.6003 | 6.7s\n  epoch  5 | loss 0.4941 | valid GAUC 0.6664 nDCG@5 0.5360 primary 0.6012 | 6.1s\n  epoch  6 | loss 0.4897 | valid GAUC 0.6662 nDCG@5 0.5349 primary 0.6006 | 6.0s\n  epoch  7 | loss 0.4859 | valid GAUC 0.6670 nDCG@5 0.5352 primary 0.6011 | 5.9s\n  epoch  8 | loss 0.4818 | valid GAUC 0.6667 nDCG@5 0.5347 primary 0.6007 | 6.0s\n  epoch  9 | loss 0.4778 | valid GAUC 0.6654 nDCG@5 0.5337 primary 0.5996 | 5.9s\n  early stop at epoch 9\n[EVAL] GAUC: 0.6664 | nDCG@5: 0.5360 | Primary: 0.6012\n"
+      },
+      "delta_over_baseline": 0.0,
+      "error_recovery": null,
+      "prompt_tokens": 0,
+      "completion_tokens": 0,
+      "wall_clock_seconds": 88.4287428855896,
+      "manual_interventions": 0
+    },
+    {
+      "iteration_id": 1,
+      "parent_node_id": null,
+      "node_id": 1,
+      "stage": "Feature Engineering",
+      "hypothesis": "Expand 5 fields to CWM 13 user/video domains.",
+      "target_file": "pipeline/train.py",
+      "code_diff": "Executed: C:\\Users\\Burthus\\AppData\\Local\\Python\\pythoncore-3.14-64\\python.exe -m pipeline.train --model fm --cwm",
+      "status": "REJECTED",
+      "metrics": {
+        "gauc": 0.6649,
+        "ndcg_5": 0.5347,
+        "primary_score": 0.5998,
+        "delta_from_baseline": -0.0018000000000000238,
+        "is_converged": false,
+        "raw_stdout": "94 | 10.0s\n  epoch  5 | loss 0.4944 | valid GAUC 0.6649 nDCG@5 0.5347 primary 0.5998 | 10.0s\n  epoch  6 | loss 0.4914 | valid GAUC 0.6641 nDCG@5 0.5339 primary 0.5990 | 10.0s\n  epoch  7 | loss 0.4889 | valid GAUC 0.6643 nDCG@5 0.5338 primary 0.5990 | 10.0s\n  epoch  8 | loss 0.4865 | valid GAUC 0.6632 nDCG@5 0.5334 primary 0.5983 | 10.2s\n  epoch  9 | loss 0.4842 | valid GAUC 0.6626 nDCG@5 0.5325 primary 0.5975 | 10.2s\n  early stop at epoch 9\n[EVAL] GAUC: 0.6649 | nDCG@5: 0.5347 | Primary: 0.5998\n"
+      },
+      "delta_over_baseline": -0.0018000000000000238,
+      "error_recovery": null,
+      "prompt_tokens": 0,
+      "completion_tokens": 0,
+      "wall_clock_seconds": 133.26391458511353,
+      "manual_interventions": 0
+    },
+    {
+      "iteration_id": 2,
+      "parent_node_id": null,
+      "node_id": 2,
+      "stage": "Architecture",
+      "hypothesis": "Train DeepFM with 2nd order feature factor embeddings & Deep MLP.",
+      "target_file": "pipeline/models.py",
+      "code_diff": "Executed: C:\\Users\\Burthus\\AppData\\Local\\Python\\pythoncore-3.14-64\\python.exe -m pipeline.train --model deepfm --cwm",
+      "status": "REJECTED",
+      "metrics": {
+        "gauc": 0.6665,
+        "ndcg_5": 0.5344,
+        "primary_score": 0.6004,
+        "delta_from_baseline": -0.0011999999999999789,
+        "is_converged": false,
+        "raw_stdout": ".5363 | valid GAUC 0.6658 nDCG@5 0.5349 primary 0.6004 | 32.4s (cpu)\n  epoch  2 | loss 0.5049 | valid GAUC 0.6665 nDCG@5 0.5344 primary 0.6004 | 29.9s (cpu)\n  epoch  3 | loss 0.4908 | valid GAUC 0.6633 nDCG@5 0.5335 primary 0.5984 | 29.9s (cpu)\n  epoch  4 | loss 0.4711 | valid GAUC 0.6469 nDCG@5 0.5256 primary 0.5863 | 30.5s (cpu)\n  epoch  5 | loss 0.4435 | valid GAUC 0.6359 nDCG@5 0.5202 primary 0.5781 | 31.2s (cpu)\n  early stop at epoch 5\n[EVAL] GAUC: 0.6665 | nDCG@5: 0.5344 | Primary: 0.6004\n"
+      },
+      "delta_over_baseline": -0.0011999999999999789,
+      "error_recovery": null,
+      "prompt_tokens": 0,
+      "completion_tokens": 0,
+      "wall_clock_seconds": 197.36163520812988,
+      "manual_interventions": 0
+    },
+    {
+      "iteration_id": 3,
+      "parent_node_id": null,
+      "node_id": 3,
+      "stage": "Hyperparameter Tuning",
+      "hypothesis": "Tune learning rate to 0.0005 with weight decay on DeepFM.",
+      "target_file": "pipeline/train.py",
+      "code_diff": "Executed: C:\\Users\\Burthus\\AppData\\Local\\Python\\pythoncore-3.14-64\\python.exe -m pipeline.train --model deepfm --cwm --lr 0.0005 --epochs 30",
+      "status": "REJECTED",
+      "metrics": {
+        "gauc": 0.6652,
+        "ndcg_5": 0.5349,
+        "primary_score": 0.6001,
+        "delta_from_baseline": -0.0015000000000000568,
+        "is_converged": false,
+        "raw_stdout": "n device: cpu...\n==> Total categorical dimension: 47,485, Fields: 13\n  epoch  1 | loss 0.5427 | valid GAUC 0.6652 nDCG@5 0.5349 primary 0.6001 | 32.0s (cpu)\n  epoch  2 | loss 0.5041 | valid GAUC 0.6654 nDCG@5 0.5345 primary 0.6000 | 30.6s (cpu)\n  epoch  3 | loss 0.4893 | valid GAUC 0.6626 nDCG@5 0.5333 primary 0.5980 | 31.8s (cpu)\n  epoch  4 | loss 0.4684 | valid GAUC 0.6451 nDCG@5 0.5253 primary 0.5852 | 30.7s (cpu)\n  early stop at epoch 4\n[EVAL] GAUC: 0.6652 | nDCG@5: 0.5349 | Primary: 0.6001\n"
+      },
+      "delta_over_baseline": -0.0015000000000000568,
+      "error_recovery": null,
+      "prompt_tokens": 0,
+      "completion_tokens": 0,
+      "wall_clock_seconds": 169.43366742134094,
+      "manual_interventions": 0
+    }
+  ]
+}

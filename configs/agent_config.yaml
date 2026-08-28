@@ -1,0 +1,27 @@
+# RankAgent Core Orchestrator Configuration
+
+agent:
+  name: "RankAgent"
+  model: "gpt-4o" # or "claude-3-5-sonnet", "gemini-1.5-pro"
+  temperature: 0.2
+  search_algorithm: "agentic_tree_search"
+  max_tree_depth: 10
+  max_children_per_node: 4
+
+sandbox:
+  timeout_seconds_per_iteration: 900 # 15 min per trial
+  memory_limit_gb: 16
+  cuda_visible_devices: "0"
+  random_seed: 42
+
+debugger:
+  max_self_healing_attempts: 3
+  auto_fallback_on_oom: true
+  auto_adjust_batch_size: true
+
+logging:
+  log_dir: "logs"
+  save_code_diffs: true
+  save_checkpoints: true
+  export_format: ["json", "md"]
+

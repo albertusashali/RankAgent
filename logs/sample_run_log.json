@@ -1,0 +1,106 @@
+{
+  "run_id": "run-kuairand-pure-sample",
+  "benchmark": "KuaiRand-Pure",
+  "official_baseline_validation": {
+    "gauc": 0.6674,
+    "ndcg_at_5": 0.5357,
+    "primary_score": 0.6016
+  },
+  "total_iterations": 21,
+  "total_wall_clock_seconds": 3120,
+  "total_tokens": {
+    "prompt_tokens": 124500,
+    "completion_tokens": 43900,
+    "total": 168400
+  },
+  "manual_interventions": 0,
+  "converged": true,
+  "convergence_reason": "Delta validation score <= 0.002 over last 3 consecutive iterations (N=3)",
+  "best_iteration_id": 21,
+  "best_validation_metrics": {
+    "gauc": 0.7310,
+    "ndcg_at_5": 0.6085,
+    "primary_score": 0.6698,
+    "delta_over_baseline": 0.0682
+  },
+  "iterations": [
+    {
+      "iteration_id": 0,
+      "parent_iteration_id": null,
+      "stage": "Baseline Reproduction",
+      "hypothesis": "Reproduce the official NumPy Factorization Machine baseline on fixed date splits.",
+      "code_diff": "Initial FM baseline reproduction script.",
+      "metrics": {
+        "gauc": 0.6674,
+        "ndcg_at_5": 0.5357,
+        "primary_score": 0.6016,
+        "delta_from_parent": 0.0,
+        "delta_from_baseline": 0.0
+      },
+      "status": "ACCEPTED",
+      "error_event": null,
+      "wall_clock_seconds": 42.1,
+      "tokens_used": 1420
+    },
+    {
+      "iteration_id": 1,
+      "parent_iteration_id": 0,
+      "stage": "Feature Engineering",
+      "hypothesis": "Add historical user and video interaction frequency statistics to provide dense engagement priors.",
+      "code_diff": "+ user_stats = df_train.groupby('user_id')['long_view'].agg(['count', 'mean'])\n+ item_stats = df_train.groupby('video_id')['long_view'].agg(['count', 'mean'])",
+      "metrics": {
+        "gauc": 0.6812,
+        "ndcg_at_5": 0.5510,
+        "primary_score": 0.6161,
+        "delta_from_parent": 0.0145,
+        "delta_from_baseline": 0.0145
+      },
+      "status": "ACCEPTED",
+      "error_event": null,
+      "wall_clock_seconds": 68.4,
+      "tokens_used": 3850
+    },
+    {
+      "iteration_id": 8,
+      "parent_iteration_id": 5,
+      "stage": "Architecture",
+      "hypothesis": "Train DCN-v2 (Deep & Cross Network) with dense historical embeddings.",
+      "code_diff": "+ class DCNv2(nn.Module):\n+     def __init__(self, num_cross_layers=3): ...",
+      "metrics": {
+        "gauc": 0.7085,
+        "ndcg_at_5": 0.5810,
+        "primary_score": 0.6448,
+        "delta_from_parent": 0.0066,
+        "delta_from_baseline": 0.0432
+      },
+      "status": "ERROR_RECOVERED",
+      "error_event": {
+        "error_type": "RuntimeError: Dimension mismatch in CrossNetwork",
+        "traceback": "File 'models/dcn.py', line 45 in forward: in_features mismatch",
+        "recovery_action": "Added explicit Linear projection before CrossNetwork layer",
+        "recovery_success": true
+      },
+      "wall_clock_seconds": 156.2,
+      "tokens_used": 6820
+    },
+    {
+      "iteration_id": 21,
+      "parent_iteration_id": 16,
+      "stage": "Ensembling",
+      "hypothesis": "Ensemble GBDT LambdaMART ranker with Deep Multi-Task MMoE network via rank-normalized weighted average.",
+      "code_diff": "+ final_score = 0.45 * rank_norm(score_lgb) + 0.55 * rank_norm(score_mmoe)",
+      "metrics": {
+        "gauc": 0.7310,
+        "ndcg_at_5": 0.6085,
+        "primary_score": 0.6698,
+        "delta_from_parent": 0.0070,
+        "delta_from_baseline": 0.0682
+      },
+      "status": "ACCEPTED",
+      "error_event": null,
+      "wall_clock_seconds": 88.3,
+      "tokens_used": 4120
+    }
+  ]
+}
+
