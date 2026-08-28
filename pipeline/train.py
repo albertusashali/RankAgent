@@ -1,403 +1,481 @@
+"""Training harness for KuaiRand-Pure.
+
+Every trainer here obeys two rules that the challenge imposes:
+
+  1. **Selection is on validation only.** Nothing in this file computes, prints or
+     returns a hidden-test metric. Test rows arrive from the loader with their
+     labels withheld, so a test score is not merely discouraged — it is
+     unavailable. Test *predictions* are produced only by ``predict_test``,
+     which the submission step calls after a checkpoint has been chosen.
+  2. **The baseline is reproducible.** ``--model fm`` runs the numpy FM with the
+     organizer's hyperparameters and must land on validation primary 0.6016.
+
+Every run writes ``checkpoints/<model>.meta.json`` next to its weights, recording
+the exact constructor arguments. The submission step rebuilds the model from that
+file rather than guessing, which is what previously broke when a run used a
+non-default embedding size.
 """
-Training and Optimization harness for KuaiRand recommendation models.
-Supports Factorization Machines, DeepFM, MMoE, DIN (Deep Interest Network), and LightGBM GBDT Ranker.
-Includes automatic model checkpoint persistence in checkpoints/.
-"""
+import argparse
+import json
 import os
 import time
-import argparse
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
-import torch
-import torch.nn as nn
-from torch.utils.data import TensorDataset, DataLoader
-from typing import Dict, Any
 
 from pipeline.data import load_kuairand
-from pipeline.features import encode_features, extract_dense_tabular_features, extract_sequential_features
-from pipeline.models import NumpyFM, DeepFM, MMoE, DIN, DEVICE
-from pipeline.evaluate import evaluate
-from pipeline.submit import generate_submission
+from pipeline.evaluate import evaluate, format_eval_line
+from pipeline.features import (encode_features, extract_dense_tabular_features,
+                               extract_sequential_features)
+from pipeline.models_np import NumpyFM
+
+# NOTE ON IMPORTS. Neither torch nor LightGBM is imported at module scope. They
+# vendor conflicting OpenMP runtimes and segfault when both are loaded into one
+# process, in either order, so each trainer imports only what it needs at call
+# time. A process that trains the numpy baseline loads neither. Keep it that way:
+# a module-level `import torch` here would break `--model lgb` again.
 
 CHECKPOINTS_DIR = "checkpoints"
 os.makedirs(CHECKPOINTS_DIR, exist_ok=True)
 
-def train_numpy_fm(enc: Dict, total_dim: int, k: int = 16, lr: float = 0.001, epochs: int = 40, bs: int = 8192, patience: int = 4, seed: int = 0) -> Dict[str, Any]:
+#: Auxiliary MMoE tasks, in tower order after task 0 (long_view).
+AUX_TASKS = ['click', 'like', 'forward']
+
+
+class TrainResult(dict):
+    """Validation metrics plus enough metadata to rebuild the model later."""
+
+    @property
+    def primary(self) -> float:
+        return self['valid']['primary']
+
+
+def _save_meta(name: str, meta: dict):
+    with open(os.path.join(CHECKPOINTS_DIR, f"{name}.meta.json"), "w") as fh:
+        json.dump(meta, fh, indent=2)
+
+
+def _finish(name: str, valid_metrics: dict, meta: dict) -> TrainResult:
+    _save_meta(name, meta)
+    print(format_eval_line(valid_metrics))
+    return TrainResult(valid=valid_metrics, checkpoint=name, meta=meta)
+
+
+# ---------------------------------------------------------------------------
+# Grouped batching for the ranking losses
+# ---------------------------------------------------------------------------
+
+def _user_groups(users: List[str]) -> List[np.ndarray]:
+    idx: Dict[str, List[int]] = {}
+    for i, u in enumerate(users):
+        idx.setdefault(u, []).append(i)
+    return [np.asarray(v, dtype=np.int64) for v in idx.values()]
+
+
+def _grouped_batches(groups: List[np.ndarray], rng: np.random.Generator,
+                     target_rows: int, max_group: int = 64):
+    """Yield ``(row_indices, group_ids)`` where each group is one user's impressions.
+
+    Pointwise training can shuffle rows freely, but a within-user loss needs a
+    user's impressions to arrive together. Oversized users are subsampled so one
+    heavy user cannot dominate a batch.
+    """
+    order = rng.permutation(len(groups))
+    rows: List[np.ndarray] = []
+    gids: List[np.ndarray] = []
+    n_rows = 0
+    g = 0
+    for gi in order:
+        members = groups[gi]
+        if len(members) > max_group:
+            members = rng.choice(members, size=max_group, replace=False)
+        if len(members) < 2:
+            continue                       # a singleton list has no ordering to learn
+        rows.append(members)
+        gids.append(np.full(len(members), g, dtype=np.int64))
+        n_rows += len(members)
+        g += 1
+        if n_rows >= target_rows:
+            yield np.concatenate(rows), np.concatenate(gids), g
+            rows, gids, n_rows, g = [], [], 0, 0
+    if rows:
+        yield np.concatenate(rows), np.concatenate(gids), g
+
+
+# ---------------------------------------------------------------------------
+# Prediction helpers
+# ---------------------------------------------------------------------------
+
+def _predict_torch(model, X: np.ndarray, hist: Optional[np.ndarray] = None,
+                   bs: int = 65536) -> np.ndarray:
+    import torch
+    from pipeline.models import DEVICE
+    model.eval()
+    out = []
+    with torch.no_grad():
+        for i in range(0, len(X), bs):
+            xb = torch.from_numpy(X[i:i + bs]).long().to(DEVICE)
+            if hist is not None:
+                hb = torch.from_numpy(hist[i:i + bs]).long().to(DEVICE)
+                out.append(model(xb, hb).cpu().numpy())
+            else:
+                res = model(xb)
+                out.append((res[0] if isinstance(res, tuple) else res).cpu().numpy())
+    return np.concatenate(out).astype(np.float64)
+
+
+# ---------------------------------------------------------------------------
+# 1. Official baseline — numpy FM
+# ---------------------------------------------------------------------------
+
+def train_numpy_fm(splits: Dict, k: int = 16, lr: float = 0.001, epochs: int = 40,
+                   bs: int = 8192, patience: int = 4, seed: int = 0,
+                   use_cwm: bool = False, verbose: bool = True) -> TrainResult:
+    enc, encoder = encode_features(splits, use_cwm_fields=use_cwm)
     Xtr, ytr, _ = enc['train']
     Xva, yva, uva = enc['valid']
-    Xte, yte, ute = enc['test']
-    
-    m = NumpyFM(total_dim, k=k, lr=lr, seed=seed)
+
+    m = NumpyFM(encoder.total_dim, k=k, lr=lr, seed=seed)
     rng = np.random.default_rng(seed)
-    best_primary, best_state, bad_epochs = -1.0, None, 0
-    
+    best, best_state, bad = -1.0, None, 0
+
     for ep in range(1, epochs + 1):
         t0 = time.time()
         idx = rng.permutation(len(ytr))
-        losses = [m.step(Xtr[idx[i:i + bs]], ytr[idx[i:i + bs]]) for i in range(0, len(idx), bs)]
-        
-        va_preds = m.predict(Xva)
-        va = evaluate(uva, yva, va_preds)
-        print(f"  epoch {ep:2d} | loss {np.mean(losses):.4f} | valid GAUC {va['GAUC']:.4f} nDCG@5 {va['nDCG@5']:.4f} primary {va['primary']:.4f} | {time.time()-t0:.1f}s")
-        
-        if va['primary'] > best_primary + 1e-5:
-            best_primary = va['primary']
-            bad_epochs = 0
+        losses = [m.step(Xtr[idx[i:i + bs]], ytr[idx[i:i + bs]])
+                  for i in range(0, len(idx), bs)]
+        va = evaluate(uva, yva, m.predict(Xva))
+        if verbose:
+            print(f"  epoch {ep:2d} | loss {np.mean(losses):.4f} | valid GAUC {va['GAUC']:.4f} "
+                  f"nDCG@5 {va['nDCG@5']:.4f} primary {va['primary']:.4f} | {time.time()-t0:.1f}s")
+        if va['primary'] > best + 1e-5:
+            best, bad = va['primary'], 0
             best_state = (m.V.copy(), m.W.copy(), np.float32(m.b))
         else:
-            bad_epochs += 1
-            if bad_epochs >= patience:
-                print(f"  early stop at epoch {ep}")
+            bad += 1
+            if bad >= patience:
+                if verbose:
+                    print(f"  early stop at epoch {ep}")
                 break
-                
+
     m.V, m.W, m.b = best_state
-    va_preds = m.predict(Xva)
-    te_preds = m.predict(Xte)
-    final_va = evaluate(uva, yva, va_preds)
-    final_te = evaluate(ute, yte, te_preds)
-    
-    np.savez_compressed(os.path.join(CHECKPOINTS_DIR, "best_fm.npz"), V=m.V, W=m.W, b=m.b)
-    print(f"[EVAL] GAUC: {final_va['GAUC']:.4f} | nDCG@5: {final_va['nDCG@5']:.4f} | Primary: {final_va['primary']:.4f}")
-    return {'valid': final_va, 'test': final_te, 'va_preds': va_preds, 'te_preds': te_preds}
+    np.savez_compressed(os.path.join(CHECKPOINTS_DIR, "fm.npz"), V=m.V, W=m.W, b=m.b)
+    return _finish("fm", evaluate(uva, yva, m.predict(Xva)),
+                   {"model": "fm", "k": k, "lr": lr, "seed": seed, "use_cwm": use_cwm})
 
-def train_pytorch_deepfm(splits: Dict, use_dense: bool = True, embed_dim: int = 16, lr: float = 0.001, epochs: int = 20, bs: int = 4096, patience: int = 3, seed: int = 0) -> Dict[str, Any]:
+
+# ---------------------------------------------------------------------------
+# 2. Torch single-task models (FM / DeepFM / DIN) with swappable loss
+# ---------------------------------------------------------------------------
+
+def train_torch(splits: Dict, arch: str = 'fm_torch', loss: str = 'listwise',
+                embed_dim: int = 16, lr: float = 0.001, epochs: int = 20,
+                bs: int = 8192, patience: int = 3, seed: int = 0,
+                use_cwm: bool = False, weight_decay: float = 1e-6,
+                max_seq_len: int = 10, verbose: bool = True) -> TrainResult:
+    """Train an embedding model under a pointwise, pairwise or listwise objective."""
+    import torch
+    import torch.nn as nn
+    from pipeline.models import DEVICE, LOSSES, DIN, DeepFM, TorchFM
+
     torch.manual_seed(seed)
-    enc_cat, total_dim, field_names = encode_features(splits, use_cwm_fields=True)
-    Xtr_c, ytr, _ = enc_cat['train']
-    Xva_c, yva, uva = enc_cat['valid']
-    Xte_c, yte, ute = enc_cat['test']
-    
-    train_dataset = TensorDataset(
-        torch.from_numpy(Xtr_c).long(),
-        torch.from_numpy(ytr).float()
-    )
-    train_loader = DataLoader(train_dataset, batch_size=bs, shuffle=True)
-    
-    model = DeepFM(total_dim, num_fields=len(field_names), embed_dim=embed_dim, dropout=0.2).to(DEVICE)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
-    criterion = nn.BCELoss()
-    
-    best_primary, bad_epochs, best_weights = -1.0, 0, None
-    
-    for ep in range(1, epochs + 1):
-        t0 = time.time()
-        model.train()
-        losses = []
-        for bx_c, by in train_loader:
-            bx_c = bx_c.to(DEVICE)
-            by = by.to(DEVICE)
-            
-            optimizer.zero_grad()
-            preds = model(bx_c)
-            loss = criterion(preds, by)
-            loss.backward()
-            optimizer.step()
-            losses.append(loss.item())
-            
-        model.eval()
-        with torch.no_grad():
-            va_preds = []
-            for i in range(0, len(Xva_c), 65536):
-                batch_c = torch.from_numpy(Xva_c[i:i+65536]).long().to(DEVICE)
-                va_preds.append(model(batch_c).cpu().numpy())
-            va_preds = np.concatenate(va_preds)
-            
-        va = evaluate(uva, yva, va_preds)
-        print(f"  epoch {ep:2d} | loss {np.mean(losses):.4f} | valid GAUC {va['GAUC']:.4f} nDCG@5 {va['nDCG@5']:.4f} primary {va['primary']:.4f} | {time.time()-t0:.1f}s ({DEVICE})")
-        
-        if va['primary'] > best_primary + 1e-5:
-            best_primary = va['primary']
-            bad_epochs = 0
-            best_weights = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-        else:
-            bad_epochs += 1
-            if bad_epochs >= patience:
-                print(f"  early stop at epoch {ep}")
-                break
-                
-    model.load_state_dict({k: v.to(DEVICE) for k, v in best_weights.items()})
-    torch.save(best_weights, os.path.join(CHECKPOINTS_DIR, "best_deepfm.pt"))
-    
-    model.eval()
-    with torch.no_grad():
-        va_preds = np.concatenate([model(torch.from_numpy(Xva_c[i:i+65536]).long().to(DEVICE)).cpu().numpy() for i in range(0, len(Xva_c), 65536)])
-        te_preds = np.concatenate([model(torch.from_numpy(Xte_c[i:i+65536]).long().to(DEVICE)).cpu().numpy() for i in range(0, len(Xte_c), 65536)])
-        
-    final_va = evaluate(uva, yva, va_preds)
-    final_te = evaluate(ute, yte, te_preds)
-    print(f"[EVAL] GAUC: {final_va['GAUC']:.4f} | nDCG@5: {final_va['nDCG@5']:.4f} | Primary: {final_va['primary']:.4f}")
-    return {'valid': final_va, 'test': final_te, 'va_preds': va_preds, 'te_preds': te_preds}
+    np.random.seed(seed)
 
-def train_pytorch_din(splits: Dict, embed_dim: int = 16, lr: float = 0.001, epochs: int = 15, bs: int = 4096, patience: int = 3, seed: int = 0) -> Dict[str, Any]:
-    """
-    Phase 4: Deep Interest Network (DIN) with Sequential Target-Attention Pooling.
-    """
-    torch.manual_seed(seed)
-    enc_cat, total_dim, field_names = encode_features(splits, use_cwm_fields=False)
-    seqs, num_vids = extract_sequential_features(splits, max_seq_len=5)
-    
-    Xtr_c, ytr, _ = enc_cat['train']
-    Xtr_h = seqs['train']
-    
-    Xva_c, yva, uva = enc_cat['valid']
-    Xva_h = seqs['valid']
-    
-    Xte_c, yte, ute = enc_cat['test']
-    Xte_h = seqs['test']
-    
-    train_dataset = TensorDataset(
-        torch.from_numpy(Xtr_c).long(),
-        torch.from_numpy(Xtr_h).long(),
-        torch.from_numpy(ytr).float()
-    )
-    train_loader = DataLoader(train_dataset, batch_size=bs, shuffle=True)
-    
-    model = DIN(total_dim, num_fields=len(field_names), num_vids=num_vids, embed_dim=embed_dim, dropout=0.15).to(DEVICE)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
-    criterion = nn.BCELoss()
-    
-    best_primary, bad_epochs, best_weights = -1.0, 0, None
-    print(f"==> Training DIN (Deep Interest Network) with Sequential Attention on device: {DEVICE}...")
-    
-    for ep in range(1, epochs + 1):
-        t0 = time.time()
-        model.train()
-        losses = []
-        for bx_c, bx_h, by in train_loader:
-            bx_c, bx_h, by = bx_c.to(DEVICE), bx_h.to(DEVICE), by.to(DEVICE)
-            
-            optimizer.zero_grad()
-            preds = model(bx_c, bx_h)
-            loss = criterion(preds, by)
-            loss.backward()
-            optimizer.step()
-            losses.append(loss.item())
-            
-        model.eval()
-        with torch.no_grad():
-            va_preds = []
-            for i in range(0, len(Xva_c), 65536):
-                batch_c = torch.from_numpy(Xva_c[i:i+65536]).long().to(DEVICE)
-                batch_h = torch.from_numpy(Xva_h[i:i+65536]).long().to(DEVICE)
-                va_preds.append(model(batch_c, batch_h).cpu().numpy())
-            va_preds = np.concatenate(va_preds)
-            
-        va = evaluate(uva, yva, va_preds)
-        print(f"  epoch {ep:2d} | loss {np.mean(losses):.4f} | valid GAUC {va['GAUC']:.4f} nDCG@5 {va['nDCG@5']:.4f} primary {va['primary']:.4f} | {time.time()-t0:.1f}s ({DEVICE})")
-        
-        if va['primary'] > best_primary + 1e-5:
-            best_primary = va['primary']
-            bad_epochs = 0
-            best_weights = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-        else:
-            bad_epochs += 1
-            if bad_epochs >= patience:
-                print(f"  early stop at epoch {ep}")
-                break
-                
-    model.load_state_dict({k: v.to(DEVICE) for k, v in best_weights.items()})
-    torch.save(best_weights, os.path.join(CHECKPOINTS_DIR, "best_din.pt"))
-    
-    model.eval()
-    with torch.no_grad():
-        va_preds = np.concatenate([model(torch.from_numpy(Xva_c[i:i+65536]).long().to(DEVICE), torch.from_numpy(Xva_h[i:i+65536]).long().to(DEVICE)).cpu().numpy() for i in range(0, len(Xva_c), 65536)])
-        te_preds = np.concatenate([model(torch.from_numpy(Xte_c[i:i+65536]).long().to(DEVICE), torch.from_numpy(Xte_h[i:i+65536]).long().to(DEVICE)).cpu().numpy() for i in range(0, len(Xte_c), 65536)])
-        
-    final_va = evaluate(uva, yva, va_preds)
-    final_te = evaluate(ute, yte, te_preds)
-    print(f"[EVAL] GAUC: {final_va['GAUC']:.4f} | nDCG@5: {final_va['nDCG@5']:.4f} | Primary: {final_va['primary']:.4f}")
-    return {'valid': final_va, 'test': final_te, 'va_preds': va_preds, 'te_preds': te_preds}
-
-def train_pytorch_mmoe(splits: Dict, embed_dim: int = 16, num_experts: int = 4, expert_dim: int = 64, lr: float = 0.001, epochs: int = 20, bs: int = 4096, patience: int = 3, seed: int = 0) -> Dict[str, Any]:
-    torch.manual_seed(seed)
-    enc_cat, total_dim, field_names = encode_features(splits, use_cwm_fields=False)
-    
-    tr_rows = splits['train']
-    Xtr_c = enc_cat['train'][0]
-    
-    ytr_long = np.array([r['label'] for r in tr_rows], dtype=np.float32)
-    ytr_click = np.array([r.get('click', 0) for r in tr_rows], dtype=np.float32)
-    ytr_like = np.array([r.get('like', 0) for r in tr_rows], dtype=np.float32)
-    
-    Xva_c, yva_long, uva = enc_cat['valid']
-    Xte_c, yte_long, ute = enc_cat['test']
-    
-    train_dataset = TensorDataset(
-        torch.from_numpy(Xtr_c).long(),
-        torch.from_numpy(ytr_long).float(),
-        torch.from_numpy(ytr_click).float(),
-        torch.from_numpy(ytr_like).float()
-    )
-    train_loader = DataLoader(train_dataset, batch_size=bs, shuffle=True)
-    
-    model = MMoE(total_dim, num_fields=len(field_names), embed_dim=embed_dim, num_experts=num_experts, expert_dim=expert_dim, num_tasks=3).to(DEVICE)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
-    bce_loss = nn.BCELoss()
-    
-    best_primary, bad_epochs, best_weights = -1.0, 0, None
-    print(f"==> Training Multi-Task MMoE with {len(field_names)} fields on device: {DEVICE}...")
-    
-    for ep in range(1, epochs + 1):
-        t0 = time.time()
-        model.train()
-        losses = []
-        for bx_c, by_long, by_click, by_like in train_loader:
-            bx_c = bx_c.to(DEVICE)
-            by_long, by_click, by_like = by_long.to(DEVICE), by_click.to(DEVICE), by_like.to(DEVICE)
-            
-            optimizer.zero_grad()
-            out_long, out_click, out_like = model(bx_c)
-            
-            l_long = bce_loss(out_long, by_long)
-            l_click = bce_loss(out_click, by_click)
-            l_like = bce_loss(out_like, by_like)
-            
-            total_loss = l_long + 0.3 * l_click + 0.3 * l_like
-            total_loss.backward()
-            optimizer.step()
-            losses.append(total_loss.item())
-            
-        model.eval()
-        with torch.no_grad():
-            va_preds = []
-            for i in range(0, len(Xva_c), 65536):
-                batch_c = torch.from_numpy(Xva_c[i:i+65536]).long().to(DEVICE)
-                out_long, _, _ = model(batch_c)
-                va_preds.append(out_long.cpu().numpy())
-            va_preds = np.concatenate(va_preds)
-            
-        va = evaluate(uva, yva_long, va_preds)
-        print(f"  epoch {ep:2d} | loss {np.mean(losses):.4f} | valid GAUC {va['GAUC']:.4f} nDCG@5 {va['nDCG@5']:.4f} primary {va['primary']:.4f} | {time.time()-t0:.1f}s ({DEVICE})")
-        
-        if va['primary'] > best_primary + 1e-5:
-            best_primary = va['primary']
-            bad_epochs = 0
-            best_weights = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-        else:
-            bad_epochs += 1
-            if bad_epochs >= patience:
-                print(f"  early stop at epoch {ep}")
-                break
-                
-    model.load_state_dict({k: v.to(DEVICE) for k, v in best_weights.items()})
-    torch.save(best_weights, os.path.join(CHECKPOINTS_DIR, "best_mmoe.pt"))
-    
-    model.eval()
-    with torch.no_grad():
-        va_preds = np.concatenate([model(torch.from_numpy(Xva_c[i:i+65536]).long().to(DEVICE))[0].cpu().numpy() for i in range(0, len(Xva_c), 65536)])
-        te_preds = np.concatenate([model(torch.from_numpy(Xte_c[i:i+65536]).long().to(DEVICE))[0].cpu().numpy() for i in range(0, len(Xte_c), 65536)])
-        
-    final_va = evaluate(uva, yva_long, va_preds)
-    final_te = evaluate(ute, yte_long, te_preds)
-    print(f"[EVAL] GAUC: {final_va['GAUC']:.4f} | nDCG@5: {final_va['nDCG@5']:.4f} | Primary: {final_va['primary']:.4f}")
-    return {'valid': final_va, 'test': final_te, 'va_preds': va_preds, 'te_preds': te_preds}
-
-def train_lightgbm(splits: Dict, num_trees: int = 150, lr: float = 0.05, seed: int = 0) -> Dict[str, Any]:
-    import lightgbm as lgb
-    print("==> Extracting dense historical tabular features & dynamic user-author affinities...")
-    enc, feature_names = extract_dense_tabular_features(splits)
-    Xtr, ytr, _ = enc['train']
+    enc, encoder = encode_features(splits, use_cwm_fields=use_cwm)
+    Xtr, ytr, utr = enc['train']
     Xva, yva, uva = enc['valid']
-    Xte, yte, ute = enc['test']
-    
-    print(f"==> Training LightGBM GBDT on {len(Xtr):,} rows with {len(feature_names)} features...")
-    train_data = lgb.Dataset(Xtr, label=ytr, feature_name=feature_names)
-    valid_data = lgb.Dataset(Xva, label=yva, feature_name=feature_names, reference=train_data)
-    
+    n_fields = len(encoder.field_names)
+
+    needs_hist = (arch == 'din')
+    if needs_hist:
+        seqs = extract_sequential_features(splits, encoder, max_seq_len=max_seq_len)
+        Htr, Hva = seqs['train'], seqs['valid']
+    else:
+        Htr = Hva = None
+
+    # DIN indexes the reserved padding row, so its table is one row longer.
+    rows = encoder.embedding_rows if needs_hist else encoder.total_dim
+    if arch == 'fm_torch':
+        model = TorchFM(rows, n_fields, embed_dim)
+    elif arch == 'deepfm':
+        model = DeepFM(rows, n_fields, embed_dim)
+    elif arch == 'din':
+        model = DIN(rows, n_fields, pad_id=encoder.pad_id, embed_dim=embed_dim)
+    else:
+        raise ValueError(f"unknown arch {arch!r}")
+    model = model.to(DEVICE)
+
+    loss_fn = LOSSES[loss]
+    grouped = loss in ('listwise', 'bpr')
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    rng = np.random.default_rng(seed)
+    groups = _user_groups(utr) if grouped else None
+
+    best, best_state, bad = -1.0, None, 0
+    if verbose:
+        print(f"==> {arch} | loss={loss} | dim={embed_dim} | fields={n_fields} | {DEVICE}")
+
+    for ep in range(1, epochs + 1):
+        t0 = time.time()
+        model.train()
+        losses = []
+
+        if grouped:
+            batches = _grouped_batches(groups, rng, target_rows=bs)
+        else:
+            perm = rng.permutation(len(ytr))
+            batches = ((perm[i:i + bs], None, 0) for i in range(0, len(perm), bs))
+
+        for rows_idx, gids, n_groups in batches:
+            xb = torch.from_numpy(Xtr[rows_idx]).long().to(DEVICE)
+            yb = torch.from_numpy(ytr[rows_idx]).float().to(DEVICE)
+            gb = torch.from_numpy(gids).long().to(DEVICE) if gids is not None else None
+            logits = model(xb, torch.from_numpy(Htr[rows_idx]).long().to(DEVICE)) \
+                if needs_hist else model(xb)
+
+            opt.zero_grad()
+            l = loss_fn(logits, yb, gb, n_groups)
+            l.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            opt.step()
+            losses.append(l.item())
+
+        va = evaluate(uva, yva, _predict_torch(model, Xva, Hva))
+        if verbose:
+            print(f"  epoch {ep:2d} | loss {np.mean(losses):.4f} | valid GAUC {va['GAUC']:.4f} "
+                  f"nDCG@5 {va['nDCG@5']:.4f} primary {va['primary']:.4f} | {time.time()-t0:.1f}s")
+
+        if va['primary'] > best + 1e-5:
+            best, bad = va['primary'], 0
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        else:
+            bad += 1
+            if bad >= patience:
+                if verbose:
+                    print(f"  early stop at epoch {ep}")
+                break
+
+    model.load_state_dict(best_state)
+    name = f"{arch}_{loss}"
+    torch.save(best_state, os.path.join(CHECKPOINTS_DIR, f"{name}.pt"))
+    return _finish(name, evaluate(uva, yva, _predict_torch(model.to(DEVICE), Xva, Hva)),
+                   {"model": arch, "loss": loss, "embed_dim": embed_dim, "lr": lr,
+                    "seed": seed, "use_cwm": use_cwm, "max_seq_len": max_seq_len})
+
+
+# ---------------------------------------------------------------------------
+# 3. Multi-task MMoE
+# ---------------------------------------------------------------------------
+
+def train_mmoe(splits: Dict, embed_dim: int = 16, num_experts: int = 4,
+               expert_dim: int = 64, lr: float = 0.001, epochs: int = 20,
+               bs: int = 8192, patience: int = 3, seed: int = 0,
+               loss: str = 'listwise', aux_weight: float = 0.3,
+               use_cwm: bool = False, verbose: bool = True) -> TrainResult:
+    """Joint long_view + auxiliary feedback training.
+
+    The scored head (task 0) uses the chosen ranking loss; auxiliary heads stay
+    pointwise, since their job is to regularise the shared embedding rather than
+    to be ranked.
+    """
+    import torch
+    import torch.nn as nn
+    from pipeline.models import DEVICE, LOSSES, MMoE
+
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    enc, encoder = encode_features(splits, use_cwm_fields=use_cwm)
+    Xtr, ytr, utr = enc['train']
+    Xva, yva, uva = enc['valid']
+    aux_tr = {t: np.asarray([r[t] for r in splits['train']], dtype=np.float32)
+              for t in AUX_TASKS}
+
+    model = MMoE(encoder.total_dim, len(encoder.field_names), embed_dim=embed_dim,
+                 num_experts=num_experts, expert_dim=expert_dim,
+                 num_tasks=1 + len(AUX_TASKS)).to(DEVICE)
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-6)
+    main_loss = LOSSES[loss]
+    grouped = loss in ('listwise', 'bpr')
+    bce = nn.BCEWithLogitsLoss()
+    rng = np.random.default_rng(seed)
+    groups = _user_groups(utr) if grouped else None
+
+    best, best_state, bad = -1.0, None, 0
+    if verbose:
+        print(f"==> mmoe | loss={loss} | experts={num_experts} | dim={embed_dim} | {DEVICE}")
+
+    for ep in range(1, epochs + 1):
+        t0 = time.time()
+        model.train()
+        losses = []
+        if grouped:
+            batches = _grouped_batches(groups, rng, target_rows=bs)
+        else:
+            perm = rng.permutation(len(ytr))
+            batches = ((perm[i:i + bs], None, 0) for i in range(0, len(perm), bs))
+
+        for rows_idx, gids, n_groups in batches:
+            xb = torch.from_numpy(Xtr[rows_idx]).long().to(DEVICE)
+            yb = torch.from_numpy(ytr[rows_idx]).float().to(DEVICE)
+            gb = torch.from_numpy(gids).long().to(DEVICE) if gids is not None else None
+
+            outs = model(xb)
+            opt.zero_grad()
+            total = main_loss(outs[0], yb, gb, n_groups)
+            for j, task in enumerate(AUX_TASKS, start=1):
+                tb = torch.from_numpy(aux_tr[task][rows_idx]).float().to(DEVICE)
+                total = total + aux_weight * bce(outs[j], tb)
+            total.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            opt.step()
+            losses.append(total.item())
+
+        va = evaluate(uva, yva, _predict_torch(model, Xva))
+        if verbose:
+            print(f"  epoch {ep:2d} | loss {np.mean(losses):.4f} | valid GAUC {va['GAUC']:.4f} "
+                  f"nDCG@5 {va['nDCG@5']:.4f} primary {va['primary']:.4f} | {time.time()-t0:.1f}s")
+
+        if va['primary'] > best + 1e-5:
+            best, bad = va['primary'], 0
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        else:
+            bad += 1
+            if bad >= patience:
+                if verbose:
+                    print(f"  early stop at epoch {ep}")
+                break
+
+    model.load_state_dict(best_state)
+    torch.save(best_state, os.path.join(CHECKPOINTS_DIR, "mmoe.pt"))
+    return _finish("mmoe", evaluate(uva, yva, _predict_torch(model.to(DEVICE), Xva)),
+                   {"model": "mmoe", "loss": loss, "embed_dim": embed_dim,
+                    "num_experts": num_experts, "expert_dim": expert_dim,
+                    "aux_weight": aux_weight, "lr": lr, "seed": seed, "use_cwm": use_cwm})
+
+
+# ---------------------------------------------------------------------------
+# 4. LightGBM LambdaMART
+# ---------------------------------------------------------------------------
+
+def train_lightgbm(splits: Dict, num_trees: int = 400, lr: float = 0.05,
+                   num_leaves: int = 63, seed: int = 0,
+                   objective: str = 'lambdarank', verbose: bool = True) -> TrainResult:
+    """GBDT on the causal dense features.
+
+    Defaults to ``lambdarank`` with user groups and truncation at 5, so the tree
+    ensemble optimises the same top-5 ordering nDCG@5 measures. The previous
+    ``binary`` objective scored at item-popularity level.
+    """
+    import lightgbm as lgb
+
+    dense, names = extract_dense_tabular_features(splits)
+    Xtr, ytr, utr = dense['train']
+    Xva, yva, uva = dense['valid']
+
+    # lambdarank needs contiguous groups, so sort each split by user.
+    def regroup(X, y, users):
+        order = np.argsort(np.asarray(users), kind='stable')
+        u_sorted = np.asarray(users)[order]
+        _, counts = np.unique(u_sorted, return_counts=True)
+        return X[order], y[order], list(u_sorted), counts, order
+
     params = {
-        'objective': 'binary',
-        'metric': 'auc',
-        'boosting_type': 'gbdt',
+        'objective': objective,
         'learning_rate': lr,
-        'num_leaves': 31,
-        'max_depth': 6,
+        'num_leaves': num_leaves,
+        'min_data_in_leaf': 50,
         'feature_fraction': 0.85,
         'bagging_fraction': 0.85,
         'bagging_freq': 1,
         'verbose': -1,
-        'seed': seed
+        'seed': seed,
+        'num_threads': 0,
     }
-    
-    t0 = time.time()
-    model = lgb.train(
-        params,
-        train_data,
-        num_boost_round=num_trees,
-        valid_sets=[valid_data],
-        callbacks=[lgb.early_stopping(stopping_rounds=20, verbose=False)]
-    )
-    print(f"==> LightGBM trained in {time.time()-t0:.1f}s (best iteration: {model.best_iteration})")
-    model.save_model(os.path.join(CHECKPOINTS_DIR, "best_lgb.txt"))
-    
-    va_preds = model.predict(Xva, num_iteration=model.best_iteration)
-    te_preds = model.predict(Xte, num_iteration=model.best_iteration)
-    
-    final_va = evaluate(uva, yva, va_preds)
-    final_te = evaluate(ute, yte, te_preds)
-    print(f"[EVAL] GAUC: {final_va['GAUC']:.4f} | nDCG@5: {final_va['nDCG@5']:.4f} | Primary: {final_va['primary']:.4f}")
-    return {'valid': final_va, 'test': final_te, 'va_preds': va_preds, 'te_preds': te_preds}
 
-def train_ensemble(splits: Dict, weight_neural: float = 0.65) -> Dict[str, Any]:
-    """
-    Phase 6: Rank-blended Ensemble of Multi-Task MMoE and LightGBM GBDT.
-    """
-    from scipy.stats import rankdata
-    import lightgbm as lgb
-    print("\n[ENSEMBLE] 1. Training Multi-Task MMoE...")
-    mmoe_res = train_pytorch_mmoe(splits, embed_dim=32, num_experts=6, epochs=10)
-    
-    print("\n[ENSEMBLE] 2. Training LightGBM GBDT...")
-    lgb_res = train_lightgbm(splits, num_trees=150, lr=0.05)
-    
-    uva = splits['valid']
-    ute = splits['test']
-    yva = [r['label'] for r in uva]
-    yte = [r['label'] for r in ute]
-    users_va = [r['user_id'] for r in uva]
-    users_te = [r['user_id'] for r in ute]
-    
-    mmoe_va_preds = mmoe_res['va_preds']
-    mmoe_te_preds = mmoe_res['te_preds']
-    lgb_va_preds = lgb_res['va_preds']
-    lgb_te_preds = lgb_res['te_preds']
-    
-    print(f"\n[ENSEMBLE] 3. Blending Predictions via Rank Normalization (Weight Neural={weight_neural:.2f})...")
-    blend_va = weight_neural * (rankdata(mmoe_va_preds) / len(mmoe_va_preds)) + (1.0 - weight_neural) * (rankdata(lgb_va_preds) / len(lgb_va_preds))
-    blend_te = weight_neural * (rankdata(mmoe_te_preds) / len(mmoe_te_preds)) + (1.0 - weight_neural) * (rankdata(lgb_te_preds) / len(lgb_te_preds))
-    
-    final_va = evaluate(users_va, yva, blend_va)
-    final_te = evaluate(users_te, yte, blend_te)
-    
-    generate_submission(ute, blend_te, "submission.csv")
-    print(f"[EVAL] GAUC: {final_va['GAUC']:.4f} | nDCG@5: {final_va['nDCG@5']:.4f} | Primary: {final_va['primary']:.4f}")
-    return {'valid': final_va, 'test': final_te}
+    if objective == 'lambdarank':
+        Xtr_s, ytr_s, _, gtr, _ = regroup(Xtr, ytr, utr)
+        Xva_s, yva_s, uva_s, gva, va_order = regroup(Xva, yva, uva)
+        params.update({'metric': 'ndcg', 'ndcg_eval_at': [5],
+                       'lambdarank_truncation_level': 5, 'label_gain': [0, 1]})
+        dtrain = lgb.Dataset(Xtr_s, label=ytr_s, group=gtr, feature_name=names)
+        dvalid = lgb.Dataset(Xva_s, label=yva_s, group=gva, feature_name=names,
+                             reference=dtrain)
+    else:
+        Xva_s, yva_s, uva_s = Xva, yva, uva
+        params.update({'metric': 'auc'})
+        dtrain = lgb.Dataset(Xtr, label=ytr, feature_name=names)
+        dvalid = lgb.Dataset(Xva, label=yva, feature_name=names, reference=dtrain)
+
+    t0 = time.time()
+    booster = lgb.train(params, dtrain, num_boost_round=num_trees,
+                        valid_sets=[dvalid],
+                        callbacks=[lgb.early_stopping(50, verbose=False)])
+    if verbose:
+        print(f"==> lightgbm[{objective}] {time.time()-t0:.1f}s, "
+              f"best iteration {booster.best_iteration}")
+
+    booster.save_model(os.path.join(CHECKPOINTS_DIR, "lgb.txt"))
+    va_preds = booster.predict(Xva_s, num_iteration=booster.best_iteration)
+    return _finish("lgb", evaluate(uva_s, yva_s, va_preds),
+                   {"model": "lgb", "objective": objective, "num_trees": num_trees,
+                    "lr": lr, "num_leaves": num_leaves, "seed": seed})
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+ARCHS = ['fm', 'fm_torch', 'deepfm', 'din', 'mmoe', 'lgb']
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Train a KuaiRand-Pure ranker (valid-only selection)")
+    p.add_argument('--data_dir', default=None)
+    p.add_argument('--model', default='fm', choices=ARCHS)
+    p.add_argument('--loss', default='listwise', choices=['pointwise', 'listwise', 'bpr'])
+    p.add_argument('--embed_dim', type=int, default=16)
+    p.add_argument('--experts', type=int, default=4)
+    p.add_argument('--expert_dim', type=int, default=64)
+    p.add_argument('--aux_weight', type=float, default=0.3)
+    p.add_argument('--lr', type=float, default=None, help='defaults per model')
+    p.add_argument('--epochs', type=int, default=20)
+    p.add_argument('--batch_size', type=int, default=8192)
+    p.add_argument('--patience', type=int, default=3)
+    p.add_argument('--trees', type=int, default=400)
+    p.add_argument('--num_leaves', type=int, default=63)
+    p.add_argument('--objective', default='lambdarank', choices=['lambdarank', 'binary'])
+    p.add_argument('--max_seq_len', type=int, default=10)
+    p.add_argument('--cwm', action='store_true', help='add music_id/video_type/upload_type fields')
+    p.add_argument('--seed', type=int, default=0)
+    return p
+
+
+def main(argv=None) -> TrainResult:
+    args = build_parser().parse_args(argv)
+    print("==> loading KuaiRand-Pure (train + valid; hidden test is sealed)")
+    splits = load_kuairand(args.data_dir, include_extra_features=args.cwm)
+    print({k: len(v) for k, v in splits.items()})
+
+    if args.model == 'fm':
+        return train_numpy_fm(splits, lr=args.lr or 0.001, epochs=max(args.epochs, 40),
+                              bs=args.batch_size, patience=max(args.patience, 4),
+                              seed=args.seed, use_cwm=args.cwm)
+    if args.model == 'mmoe':
+        return train_mmoe(splits, embed_dim=args.embed_dim, num_experts=args.experts,
+                          expert_dim=args.expert_dim, lr=args.lr or 0.001,
+                          epochs=args.epochs, bs=args.batch_size, patience=args.patience,
+                          seed=args.seed, loss=args.loss, aux_weight=args.aux_weight,
+                          use_cwm=args.cwm)
+    if args.model == 'lgb':
+        return train_lightgbm(splits, num_trees=args.trees, lr=args.lr or 0.05,
+                              num_leaves=args.num_leaves, seed=args.seed,
+                              objective=args.objective)
+    return train_torch(splits, arch=args.model, loss=args.loss, embed_dim=args.embed_dim,
+                       lr=args.lr or 0.001, epochs=args.epochs, bs=args.batch_size,
+                       patience=args.patience, seed=args.seed, use_cwm=args.cwm,
+                       max_seq_len=args.max_seq_len)
+
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--data_dir', default=None, help='Path to KuaiRand data directory')
-    parser.add_argument('--model', default='fm', choices=['fm', 'deepfm', 'mmoe', 'din', 'lgb', 'ensemble'])
-    parser.add_argument('--cwm', action='store_true', help='Include CWM 13 feature domains')
-    parser.add_argument('--lr', type=float, default=0.001)
-    parser.add_argument('--epochs', type=int, default=20)
-    parser.add_argument('--trees', type=int, default=150)
-    parser.add_argument('--embed_dim', type=int, default=16)
-    parser.add_argument('--experts', type=int, default=4)
-    parser.add_argument('--weight_ensemble', type=float, default=0.65)
-    parser.add_argument('--seed', type=int, default=0)
-    args = parser.parse_args()
-
-    print(f"==> Loading KuaiRand dataset...")
-    splits = load_kuairand(args.data_dir, include_extra_features=True)
-    
-    if args.model == 'din':
-        train_pytorch_din(splits, embed_dim=args.embed_dim, lr=args.lr, epochs=args.epochs, seed=args.seed)
-    elif args.model == 'mmoe':
-        train_pytorch_mmoe(splits, embed_dim=args.embed_dim, num_experts=args.experts, lr=args.lr, epochs=args.epochs, seed=args.seed)
-    elif args.model == 'ensemble':
-        train_ensemble(splits, weight_neural=args.weight_ensemble)
-    elif args.model == 'lgb':
-        train_lightgbm(splits, num_trees=args.trees, lr=0.05 if args.lr == 0.001 else args.lr, seed=args.seed)
-    elif args.model == 'deepfm':
-        train_pytorch_deepfm(splits, use_dense=True, embed_dim=args.embed_dim, lr=args.lr, epochs=args.epochs, seed=args.seed)
-    elif args.model == 'fm':
-        enc, total_dim, field_names = encode_features(splits, use_cwm_fields=args.cwm)
-        train_numpy_fm(enc, total_dim, lr=args.lr, epochs=args.epochs, seed=args.seed)
+    main()

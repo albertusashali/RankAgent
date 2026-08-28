@@ -1,236 +1,249 @@
+"""Torch model architectures for KuaiRand-Pure within-user ranking.
+
+IMPORTING THIS MODULE PULLS IN TORCH. Do not import it from a code path that also
+uses LightGBM: the two vendor conflicting OpenMP runtimes and segfault when both
+are loaded (see pipeline/models_np.py). The numpy baseline lives in
+``pipeline.models_np`` precisely so it can be used without torch.
+
+  ``TorchFM``   same architecture under autograd, so the *loss* can be swapped
+  ``DeepFM``    linear + 2nd-order FM + MLP
+  ``MMoE``      multi-gate mixture-of-experts over auxiliary feedback signals
+  ``DIN``       target attention over the user's watch history
+
+All torch models emit **raw logits**. Squashing to a probability inside the model
+forces a pointwise objective and is numerically worse; ranking only cares about
+order, and the loss functions below take logits.
 """
-Recommendation Model Architectures for KuaiRand.
-Includes:
-- Official NumPy Factorization Machine (FM) Baseline
-- PyTorch DeepFM (1st + 2nd order + Deep MLP)
-- PyTorch MMoE (Multi-gate Mixture-of-Experts for Multi-Task Learning)
-- PyTorch DIN (Deep Interest Network with Target Attention Pooling)
-Supports dynamic CPU / NVIDIA CUDA GPU execution.
-"""
+from typing import List, Optional, Tuple
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, Tuple, Optional
+
+# Re-exported so callers that want the baseline can reach it from here, though
+# pipeline.train imports it from pipeline.models_np directly to stay torch-free.
+from pipeline.models_np import NumpyFM, sigmoid  # noqa: F401
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-def sigmoid(x):
-    return 1.0 / (1.0 + np.exp(-np.clip(x, -35.0, 35.0)))
 
 # =========================================================================
-# 1. Official NumPy Factorization Machine Baseline
+# Ranking losses
 # =========================================================================
-class NumpyFM:
-    def __init__(self, num_features: int, k: int = 16, lr: float = 0.001, seed: int = 0):
-        self.k = k
-        self.lr = lr
-        rng = np.random.default_rng(seed)
-        self.V = (rng.standard_normal((num_features, k), dtype=np.float32) * 0.01).astype(np.float32)
-        self.W = np.zeros(num_features, dtype=np.float32)
-        self.b = np.float32(0.0)
-        self.mV = np.zeros_like(self.V); self.vV = np.zeros_like(self.V)
-        self.mW = np.zeros_like(self.W); self.vW = np.zeros_like(self.W)
-        self.t = 0
 
-    def logits(self, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        lin = self.W[X].sum(axis=1) + self.b
-        Vx = self.V[X]
-        sum_v = Vx.sum(axis=1)
-        sum_v2 = (Vx ** 2).sum(axis=1)
-        inter = 0.5 * ((sum_v ** 2).sum(axis=1) - sum_v2.sum(axis=1))
-        return lin + inter, sum_v, Vx
+def _segment_logsumexp(scores: torch.Tensor, group: torch.Tensor, n_groups: int) -> torch.Tensor:
+    """Numerically stable log-sum-exp of ``scores`` within each group id."""
+    maxes = torch.full((n_groups,), float('-inf'), device=scores.device, dtype=scores.dtype)
+    maxes = maxes.scatter_reduce(0, group, scores, reduce='amax', include_self=True)
+    shifted = torch.exp(scores - maxes[group])
+    sums = torch.zeros(n_groups, device=scores.device, dtype=scores.dtype)
+    sums = sums.index_add(0, group, shifted)
+    return maxes + torch.log(sums + 1e-12)
 
-    def step(self, X: np.ndarray, y: np.ndarray, b1: float = 0.9, b2: float = 0.999, eps: float = 1e-8) -> float:
-        self.t += 1
-        z, sum_v, Vx = self.logits(X)
-        p = sigmoid(z)
-        g = (p - y) / len(y)
-        
-        gW = np.zeros_like(self.W)
-        np.add.at(gW, X, g[:, None])
-        
-        gVx = g[:, None, None] * (sum_v[:, None, :] - Vx)
-        gV = np.zeros_like(self.V)
-        np.add.at(gV, X, gVx)
-        
-        for P, G, M, Vv in ((self.V, gV, self.mV, self.vV), (self.W, gW, self.mW, self.vW)):
-            M *= b1; M += (1 - b1) * G
-            Vv *= b2; Vv += (1 - b2) * (G * G)
-            m_hat = M / (1 - b1 ** self.t)
-            v_hat = Vv / (1 - b2 ** self.t)
-            P -= self.lr * m_hat / (np.sqrt(v_hat) + eps)
-            
-        self.b -= self.lr * g.sum()
-        loss = -np.mean(y * np.log(p + 1e-9) + (1 - y) * np.log(1 - p + 1e-9))
-        return float(loss)
 
-    def predict(self, X: np.ndarray, bs: int = 200_000) -> np.ndarray:
-        preds = []
-        for i in range(0, len(X), bs):
-            z, _, _ = self.logits(X[i:i + bs])
-            preds.append(sigmoid(z))
-        return np.concatenate(preds)
+def pointwise_bce(logits: torch.Tensor, labels: torch.Tensor,
+                  group: Optional[torch.Tensor] = None,
+                  n_groups: int = 0) -> torch.Tensor:
+    """Per-impression binary cross-entropy. The original objective."""
+    return F.binary_cross_entropy_with_logits(logits, labels)
+
+
+def listwise_softmax(logits: torch.Tensor, labels: torch.Tensor,
+                     group: torch.Tensor, n_groups: int) -> torch.Tensor:
+    """Within-user softmax cross-entropy (ListNet-style).
+
+    The metrics are *within-user* ranking metrics, so the natural objective is a
+    likelihood over each user's own impression list rather than over the whole
+    corpus. Maximising ``P(positive | this user's impressions)`` optimises exactly
+    the quantity GAUC and nDCG@5 measure, and — unlike pointwise BCE — it is
+    invariant to any per-user score offset, which the metrics also ignore.
+    """
+    lse = _segment_logsumexp(logits, group, n_groups)
+    log_prob = logits - lse[group]
+    pos = labels > 0.5
+    if not bool(pos.any()):
+        return logits.sum() * 0.0
+    return -(log_prob[pos]).mean()
+
+
+def bpr_pairwise(logits: torch.Tensor, labels: torch.Tensor,
+                 group: torch.Tensor, n_groups: int) -> torch.Tensor:
+    """Bayesian Personalised Ranking over within-user positive/negative pairs.
+
+    For each group, pair every positive against a randomly chosen negative from
+    the same user and push their score margin apart. Directly optimises the
+    pairwise ordering that AUC counts.
+    """
+    pos_mask = labels > 0.5
+    neg_mask = ~pos_mask
+    if not (bool(pos_mask.any()) and bool(neg_mask.any())):
+        return logits.sum() * 0.0
+
+    # Sample one negative per group; groups without a negative are skipped.
+    neg_idx = torch.full((n_groups,), -1, device=logits.device, dtype=torch.long)
+    neg_positions = torch.nonzero(neg_mask, as_tuple=True)[0]
+    perm = neg_positions[torch.randperm(neg_positions.numel(), device=logits.device)]
+    neg_idx[group[perm]] = perm
+
+    pos_positions = torch.nonzero(pos_mask, as_tuple=True)[0]
+    partner = neg_idx[group[pos_positions]]
+    keep = partner >= 0
+    if not bool(keep.any()):
+        return logits.sum() * 0.0
+    margin = logits[pos_positions[keep]] - logits[partner[keep]]
+    return -F.logsigmoid(margin).mean()
+
+
+LOSSES = {
+    'pointwise': pointwise_bce,
+    'listwise': listwise_softmax,
+    'bpr': bpr_pairwise,
+}
 
 
 # =========================================================================
-# 2. PyTorch DeepFM (Linear + 2nd-order FM + Deep MLP)
+# Torch models
 # =========================================================================
-class DeepFM(nn.Module):
-    def __init__(self, num_features: int, num_fields: int, embed_dim: int = 16, hidden_dims: List[int] = [128, 64], dropout: float = 0.2):
+
+class TorchFM(nn.Module):
+    """Factorization Machine under autograd — architecturally the baseline.
+
+    Exists so the loss function can be swapped while holding the model fixed.
+    Any gain over ``NumpyFM`` is attributable to the objective, not the capacity.
+    """
+
+    def __init__(self, num_features: int, num_fields: int, embed_dim: int = 16):
         super().__init__()
-        self.num_fields = num_fields
-        self.embed_dim = embed_dim
-        
-        self.linear_embeddings = nn.Embedding(num_features, 1)
+        self.linear = nn.Embedding(num_features, 1)
+        self.factors = nn.Embedding(num_features, embed_dim)
         self.bias = nn.Parameter(torch.zeros(1))
-        
-        self.factor_embeddings = nn.Embedding(num_features, embed_dim)
-        nn.init.normal_(self.factor_embeddings.weight, std=0.01)
-        nn.init.zeros_(self.linear_embeddings.weight)
-        
-        input_dim = num_fields * embed_dim
-        layers = []
-        for h_dim in hidden_dims:
-            layers.append(nn.Linear(input_dim, h_dim))
-            layers.append(nn.BatchNorm1d(h_dim))
-            layers.append(nn.ReLU())
-            layers.append(nn.Dropout(dropout))
-            input_dim = h_dim
-        layers.append(nn.Linear(input_dim, 1))
+        nn.init.zeros_(self.linear.weight)
+        nn.init.normal_(self.factors.weight, std=0.01)
+
+    def forward(self, x_cat: torch.Tensor) -> torch.Tensor:
+        vx = self.factors(x_cat)
+        inter = 0.5 * ((vx.sum(1) ** 2) - (vx ** 2).sum(1)).sum(1)
+        return self.linear(x_cat).sum((1, 2)) + self.bias + inter
+
+
+class DeepFM(nn.Module):
+    """Linear + 2nd-order FM + deep MLP over the concatenated field embeddings."""
+
+    def __init__(self, num_features: int, num_fields: int, embed_dim: int = 16,
+                 hidden_dims: List[int] = [128, 64], dropout: float = 0.2):
+        super().__init__()
+        self.linear = nn.Embedding(num_features, 1)
+        self.factors = nn.Embedding(num_features, embed_dim)
+        self.bias = nn.Parameter(torch.zeros(1))
+        nn.init.zeros_(self.linear.weight)
+        nn.init.normal_(self.factors.weight, std=0.01)
+
+        dim = num_fields * embed_dim
+        layers: List[nn.Module] = []
+        for h in hidden_dims:
+            layers += [nn.Linear(dim, h), nn.BatchNorm1d(h), nn.ReLU(), nn.Dropout(dropout)]
+            dim = h
+        layers.append(nn.Linear(dim, 1))
         self.mlp = nn.Sequential(*layers)
 
     def forward(self, x_cat: torch.Tensor) -> torch.Tensor:
-        linear_part = self.linear_embeddings(x_cat).sum(dim=1) + self.bias
-        vx = self.factor_embeddings(x_cat)
-        sum_vx = vx.sum(dim=1)
-        sum_vx_sq = (vx ** 2).sum(dim=1)
-        fm_part = 0.5 * (sum_vx ** 2 - sum_vx_sq).sum(dim=1, keepdim=True)
-        
-        deep_emb = vx.view(vx.size(0), -1)
-        deep_part = self.mlp(deep_emb)
-        logits = linear_part + fm_part + deep_part
-        return torch.sigmoid(logits).squeeze(1)
+        vx = self.factors(x_cat)
+        inter = 0.5 * ((vx.sum(1) ** 2) - (vx ** 2).sum(1)).sum(1)
+        deep = self.mlp(vx.flatten(1)).squeeze(1)
+        return self.linear(x_cat).sum((1, 2)) + self.bias + inter + deep
 
 
-# =========================================================================
-# 3. PyTorch MMoE (Multi-gate Mixture-of-Experts for Multi-Task Learning)
-# =========================================================================
 class MMoE(nn.Module):
-    def __init__(self, num_features: int, num_fields: int, embed_dim: int = 16, num_experts: int = 4, expert_dim: int = 64, num_tasks: int = 3):
+    """Multi-gate mixture-of-experts over the auxiliary feedback signals.
+
+    KuaiRand logs long_view, click, like, follow, comment and forward on every
+    impression. Training the rare signals jointly regularises the shared
+    embedding without diluting the scored head, which keeps its own gate and tower.
+    Task 0 is always ``long_view`` — the only head used for ranking.
+    """
+
+    def __init__(self, num_features: int, num_fields: int, embed_dim: int = 16,
+                 num_experts: int = 4, expert_dim: int = 64, num_tasks: int = 3,
+                 dropout: float = 0.1):
         super().__init__()
-        self.factor_embeddings = nn.Embedding(num_features, embed_dim)
-        nn.init.normal_(self.factor_embeddings.weight, std=0.01)
-        
-        input_dim = num_fields * embed_dim
-        
+        self.num_tasks = num_tasks
+        self.factors = nn.Embedding(num_features, embed_dim)
+        nn.init.normal_(self.factors.weight, std=0.01)
+        dim = num_fields * embed_dim
+
         self.experts = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(input_dim, expert_dim),
-                nn.ReLU(),
-                nn.Dropout(0.1),
-                nn.Linear(expert_dim, expert_dim)
-            ) for _ in range(num_experts)
+            nn.Sequential(nn.Linear(dim, expert_dim), nn.ReLU(),
+                          nn.Dropout(dropout), nn.Linear(expert_dim, expert_dim))
+            for _ in range(num_experts)
         ])
-        
-        self.gates = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(input_dim, num_experts),
-                nn.Softmax(dim=-1)
-            ) for _ in range(num_tasks)
-        ])
-        
+        self.gates = nn.ModuleList([nn.Linear(dim, num_experts) for _ in range(num_tasks)])
         self.towers = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(expert_dim, 32),
-                nn.ReLU(),
-                nn.Linear(32, 1),
-                nn.Sigmoid()
-            ) for _ in range(num_tasks)
+            nn.Sequential(nn.Linear(expert_dim, 32), nn.ReLU(), nn.Linear(32, 1))
+            for _ in range(num_tasks)
         ])
 
     def forward(self, x_cat: torch.Tensor) -> Tuple[torch.Tensor, ...]:
-        input_rep = self.factor_embeddings(x_cat).view(x_cat.size(0), -1)
-        expert_outputs = torch.stack([exp(input_rep) for exp in self.experts], dim=1)
-        
-        task_outputs = []
-        for i in range(len(self.towers)):
-            gate_weights = self.gates[i](input_rep).unsqueeze(1)
-            task_rep = torch.bmm(gate_weights, expert_outputs).squeeze(1)
-            task_outputs.append(self.towers[i](task_rep).squeeze(1))
-            
-        return tuple(task_outputs)
+        rep = self.factors(x_cat).flatten(1)
+        expert_out = torch.stack([e(rep) for e in self.experts], dim=1)   # (B, E, D)
+        outs = []
+        for i in range(self.num_tasks):
+            w = torch.softmax(self.gates[i](rep), dim=-1).unsqueeze(1)     # (B, 1, E)
+            outs.append(self.towers[i](torch.bmm(w, expert_out).squeeze(1)).squeeze(1))
+        return tuple(outs)
 
 
-# =========================================================================
-# 4. PyTorch DIN (Deep Interest Network with Target Attention Pooling)
-# =========================================================================
 class DIN(nn.Module):
-    def __init__(self, num_features: int, num_fields: int, num_vids: int, embed_dim: int = 16, hidden_dims: List[int] = [128, 64], dropout: float = 0.15):
+    """Deep Interest Network — target attention over the user's watch history.
+
+    Candidate and history embeddings come from **one** table, indexed in the
+    shared id space built by ``CategoricalEncoder``. The previous version drew the
+    candidate from the categorical table and the history from a separate one, so
+    ``cand - hist`` and ``cand * hist`` compared vectors in unrelated spaces and
+    the attention unit could not learn anything meaningful.
+    """
+
+    def __init__(self, num_features: int, num_fields: int, pad_id: int,
+                 embed_dim: int = 16, hidden_dims: List[int] = [128, 64],
+                 dropout: float = 0.15, video_field_idx: int = 1):
         super().__init__()
-        self.embed_dim = embed_dim
-        self.num_fields = num_fields
-        
-        # Categorical feature embeddings
-        self.factor_embeddings = nn.Embedding(num_features, embed_dim)
-        nn.init.normal_(self.factor_embeddings.weight, std=0.01)
-        
-        # Item sequential embedding table (index 0 is padding)
-        self.item_embeddings = nn.Embedding(num_vids, embed_dim, padding_idx=0)
-        nn.init.normal_(self.item_embeddings.weight, std=0.01)
-        
-        # Attention Unit MLP: [cand, hist, cand - hist, cand * hist] -> 4 * embed_dim -> 1
-        self.attention_mlp = nn.Sequential(
-            nn.Linear(4 * embed_dim, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1)
+        self.pad_id = pad_id
+        self.video_field_idx = video_field_idx
+        # num_features already includes the reserved pad row.
+        self.factors = nn.Embedding(num_features, embed_dim, padding_idx=pad_id)
+        nn.init.normal_(self.factors.weight, std=0.01)
+        with torch.no_grad():
+            self.factors.weight[pad_id].zero_()
+
+        self.attention = nn.Sequential(
+            nn.Linear(4 * embed_dim, 64), nn.ReLU(), nn.Linear(64, 1)
         )
-        
-        # Prediction MLP
-        input_dim = num_fields * embed_dim + embed_dim  # Base categorical fields + Attention Pooled History
-        layers = []
-        for h_dim in hidden_dims:
-            layers.append(nn.Linear(input_dim, h_dim))
-            layers.append(nn.BatchNorm1d(h_dim))
-            layers.append(nn.ReLU())
-            layers.append(nn.Dropout(dropout))
-            input_dim = h_dim
-        layers.append(nn.Linear(input_dim, 1))
+
+        dim = num_fields * embed_dim + embed_dim
+        layers: List[nn.Module] = []
+        for h in hidden_dims:
+            layers += [nn.Linear(dim, h), nn.BatchNorm1d(h), nn.ReLU(), nn.Dropout(dropout)]
+            dim = h
+        layers.append(nn.Linear(dim, 1))
         self.mlp = nn.Sequential(*layers)
 
     def forward(self, x_cat: torch.Tensor, x_hist: torch.Tensor) -> torch.Tensor:
-        # x_cat: (B, num_fields)
-        # x_hist: (B, seq_len)
-        base_emb = self.factor_embeddings(x_cat).view(x_cat.size(0), -1)  # (B, num_fields * embed_dim)
-        
-        # Candidate item embedding: video_id is field 1
-        cand_emb = self.factor_embeddings(x_cat[:, 1])  # (B, embed_dim)
-        
-        # History embeddings
-        hist_emb = self.item_embeddings(x_hist)  # (B, seq_len, embed_dim)
-        
-        # Expand candidate embedding across sequence
-        cand_expanded = cand_emb.unsqueeze(1).expand_as(hist_emb)  # (B, seq_len, embed_dim)
-        
-        # Attention features: [cand, hist, cand - hist, cand * hist]
-        att_feat = torch.cat([
-            cand_expanded,
-            hist_emb,
-            cand_expanded - hist_emb,
-            cand_expanded * hist_emb
-        ], dim=-1)  # (B, seq_len, 4 * embed_dim)
-        
-        att_weights = self.attention_mlp(att_feat)  # (B, seq_len, 1)
-        
-        # Mask out padding (index 0)
-        mask = (x_hist != 0).unsqueeze(-1)  # (B, seq_len, 1)
-        att_weights = att_weights.masked_fill(~mask, -1e9)
-        att_weights = F.softmax(att_weights, dim=1)  # (B, seq_len, 1)
-        
-        # Attention pooled interest representation
-        user_interest = (att_weights * hist_emb).sum(dim=1)  # (B, embed_dim)
-        
-        # Concat base features + dynamic interest vector
-        full_rep = torch.cat([base_emb, user_interest], dim=1)
-        logits = self.mlp(full_rep)
-        return torch.sigmoid(logits).squeeze(1)
+        base = self.factors(x_cat).flatten(1)
+        cand = self.factors(x_cat[:, self.video_field_idx])          # (B, D)
+        hist = self.factors(x_hist)                                   # (B, L, D)
+
+        cand_exp = cand.unsqueeze(1).expand_as(hist)
+        att_in = torch.cat([cand_exp, hist, cand_exp - hist, cand_exp * hist], dim=-1)
+        weights = self.attention(att_in)                              # (B, L, 1)
+
+        mask = (x_hist != self.pad_id).unsqueeze(-1)
+        weights = weights.masked_fill(~mask, float('-inf'))
+        # A user with no history yet would give an all -inf row; softmax would be
+        # NaN, so fall back to a zero interest vector for those rows.
+        empty = ~mask.any(dim=1, keepdim=True)
+        weights = torch.where(empty.expand_as(weights), torch.zeros_like(weights), weights)
+        weights = torch.softmax(weights, dim=1)
+        weights = torch.where(empty.expand_as(weights), torch.zeros_like(weights), weights)
+
+        interest = (weights * hist).sum(dim=1)                        # (B, D)
+        return self.mlp(torch.cat([base, interest], dim=1)).squeeze(1)

@@ -60,7 +60,9 @@ tmp/
 Thumbs.db
 desktop.ini
 
-# Submissions (Keep submission directory structure but ignore large outputs if needed)
+# Submissions. The graded deliverable must be committable, so the final file is
+# explicitly un-ignored (both *.csv above and this directory rule would hide it).
 submissions/*.csv
+!submissions/kuairand_pure_final.csv
 !submissions/sample_submission.csv
 

@@ -3,7 +3,8 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python: 3.10+](https://img.shields.io/badge/Python-3.10+-brightgreen.svg)](https://www.python.org/)
 [![Benchmark: KuaiRand](https://img.shields.io/badge/Benchmark-KuaiRand--Pure-orange.svg)](https://kuairand.com)
-[![Status: Unified Architecture Spec](https://img.shields.io/badge/Status-Unified%20Design%20Doc-purple.svg)]()
+[![Baseline: reproduced](https://img.shields.io/badge/Baseline-reproduced%200.6015-success.svg)]()
+[![Tests: 16 passing](https://img.shields.io/badge/Tests-16%20passing-success.svg)]()
 
 > **RankAgent** is an LLM-driven autonomous machine learning research agent engineered specifically for recommender system (RecSys) ranking problems. Given a tabular/interaction dataset and target metrics, RankAgent autonomously drives the closed-loop cycle of problem formulation, exploratory data analysis, feature engineering, architecture search & multi-task modeling, training/tuning, and rigorous offline evaluation with self-healing reflection.
 
@@ -14,9 +15,9 @@
 - [2. System Architecture & Subsystem Ownership](#2-system-architecture--subsystem-ownership)
 - [3. Benchmark & Metric Specification](#3-benchmark--metric-specification)
 - [4. Repository & File Partitioning](#4-repository--file-partitioning)
-- [5. Setup & Autonomous Execution Guide](#5-setup--autonomous-execution-guide)
+- [5. Setup & Reproduction](#5-setup--reproduction)
 - [6. Evaluation, Convergence & Submission](#6-evaluation-convergence--submission)
-- [7. 3-Day Hackathon Roadmap](#7-3-day-hackathon-roadmap)
+- [7. Status & Remaining Work](#7-status--remaining-work)
 - [8. Documentation Index](#8-documentation-index)
 
 ---
@@ -133,54 +134,125 @@ RankAgent/
 
 ---
 
-## 5. Setup & Autonomous Execution Guide
+## 5. Setup & Reproduction
 
-### 5.1 Installation
+Every step below is a `make` target, verified on a clean clone (macOS, Python 3.14, CPU only).
+
 ```bash
 git clone https://github.com/albertusashali/RankAgent.git
 cd RankAgent
-pip install -r requirements.txt
+
+make venv        # .venv + dependencies
+make data        # download and extract KuaiRand-Pure (~1.4M interactions)
+make sanity      # harness self-check: random scoring must reach test primary ~0.4753
+make test        # 16 tests: scorer parity, hidden-test seal, leak regressions, convergence
+make baseline    # reproduce the official FM baseline -> valid primary 0.6015
+make agent       # run the autonomous loop end to end
 ```
 
-### 5.2 Launching Autonomous Run
+**Verified output.**
+
+| Step | Expected | Measured |
+| :--- | :--- | :--- |
+| `make sanity` | test primary ~ 0.4753 | 0.4757 |
+| `make baseline` | valid primary 0.6016 | **0.6015** (epoch-for-epoch identical to the starter kit) |
+| `make test` | all pass | 16 passed |
+
+### 5.1 Training a single model
+
 ```bash
-# Verify official starter baseline
-python pipeline/evaluate.py
-
-# Launch autonomous optimization loop
-python -m orchestrator.state_machine \
-  --config configs/benchmark_kuairand.yaml \
-  --max-iterations 50 \
-  --max-wall-clock 21600 \
-  --convergence-epsilon 0.002 \
-  --convergence-patience 3
+python -m pipeline.train --model fm_torch --loss listwise --epochs 15
+python -m pipeline.train --model mmoe --loss listwise --experts 4 --epochs 12
+python -m pipeline.train --model lgb --objective lambdarank --trees 400
 ```
+
+`--model` accepts `fm | fm_torch | deepfm | din | mmoe | lgb`; `--loss` accepts
+`pointwise | listwise | bpr`. Each run writes `checkpoints/<name>.meta.json` recording its
+exact constructor arguments, so the submission step rebuilds the model rather than guessing.
+
+> **Note on PyTorch and LightGBM.** The two vendor conflicting OpenMP runtimes and segfault
+> if both are loaded into one process, in either import order. Neither is imported at module
+> scope; each trainer imports only what it needs, and every trial runs in its own subprocess.
+> Ensembling across the two families therefore goes through cached predictions
+> (`--export`), not a shared process.
 
 ---
 
 ## 6. Evaluation, Convergence & Submission
 
-### 6.1 Convergence Criterion
-A run automatically terminates when:
-$$\Delta \text{Score}_{\text{val}} \le \varepsilon = 0.002 \quad \text{for } N = 3 \text{ consecutive iterations}$$
-or when the run hits the **50-iteration cap** or **6-hour wall-clock ceiling**.
+### 6.1 The scorer is the official scorer
 
-### 6.2 Strict Submission Verification
-Submission files are validated against the strict starter-kit protocol:
+`pipeline/evaluate.py` contains no metric implementation. It loads
+`kuairand-starter-kit/evaluate.py` verbatim, so the score we select on is byte-identical to
+the score we are ranked on. `tests/test_harness.py` asserts this and pins the tie-handling
+behaviour that a reimplementation gets wrong.
+
+### 6.2 The hidden test set is sealed in code
+
+The challenge requires the agent develop on train + validation only. That is enforced, not
+merely intended:
+
+* `load_kuairand()` returns **train and valid only**.
+* `include_test=True` returns test rows with `label = -1` — features, never targets.
+* Real test labels require `RANKAGENT_UNSEAL_TEST=1`, which the runner explicitly strips
+  from every trial's environment.
+
+An iteration that tries to select on test performance fails loudly instead of leaking.
+
+### 6.3 Convergence
+
+A run halts when validation primary has not improved by more than eps = 0.002 over the last
+N = 3 iterations — a property of the *best-so-far curve*, not of a single iteration — or on
+the 50-iteration cap or 6-hour ceiling.
+
+### 6.4 Submission
+
 ```bash
-# Validates header (row_id,user_id,video_id,score), row count (170,588), row_id alignment, and NaN check
-python pipeline/submit.py --check --file submissions/submission_best.csv
+# score each model in its own process, then blend on validation
+python -m pipeline.submit --export --checkpoint fm_torch_listwise
+python -m pipeline.submit --export --checkpoint mmoe
+python -m pipeline.submit --generate --checkpoint fm_torch_listwise mmoe \
+    --file submissions/kuairand_pure_final.csv
+
+# validate against the organizer's own checker
+cd kuairand-starter-kit && python submit.py --check --split test \
+    ../submissions/kuairand_pure_final.csv --data_dir ../data/KuaiRand-Pure/data
 ```
+
+The final file passes both our checker and the starter kit's: 170,588 rows, correct header,
+contiguous `row_id`, and row-for-row `user_id`/`video_id` alignment.
+
+### 6.5 Results
+
+Measured on validation; see [`docs/DEVPOST_SUBMISSION.md`](docs/DEVPOST_SUBMISSION.md) for the
+full table and [`logs/run_summary.json`](logs/run_summary.json) for the run record.
+
+| | Valid primary | Delta vs baseline |
+| :--- | ---: | ---: |
+| Official FM baseline | 0.6015 | 0.0000 |
+| FM, pointwise BCE (control) | 0.6011 | -0.0004 |
+| FM, within-user listwise softmax | 0.6024 | +0.0009 |
+| MMoE, listwise | 0.6021 | +0.0006 |
+| **Rank-blend (FM-listwise 0.45 / MMoE 0.55)** | **0.6040** | **+0.0025** |
+
+Hidden-test scores are deliberately absent: the agent cannot compute them.
 
 ---
 
-## 7. 3-Day Hackathon Roadmap
+## 7. Status & Remaining Work
 
-| Phase | Orchestrator & Sandbox (M1 & M2) | Prompts & Target ML Pipeline (M3 & M4) |
-| :--- | :--- | :--- |
-| **Day 1** | Implement Pydantic data contracts, FSM state machine, and convergence tracker. | Stand up FM Starter Kit baseline in `pipeline/`. Verify date splits & evaluation metrics. |
-| **Day 2** | Implement Subprocess Runner (6h ceiling), regex parser, and 3-retry self-healing debugger. | Author `prompts/recsys_kb.py` focusing on MMoE, 12 feedback signals, and CWM duration bias. |
-| **Day 3** | Run full 50-iteration autonomous exploration loop; monitor telemetry logs. | Generate final `submission.csv` via `submit.py`; finalize Devpost summary & record 3-min video. |
+**Done.** Baseline reproduces exactly; the scorer is the official one; the hidden-test seal is
+enforced in code and tested; the two label leaks (DIN history, target encoding) are fixed and
+covered by regression tests; the loop survives failures and recovers from them; telemetry is
+real; the submission passes the organizer's checker.
+
+**Open**, in priority order — see [`docs/AUDIT_AND_PLAN.md`](docs/AUDIT_AND_PLAN.md):
+
+1. **Multi-seed acceptance gating.** +0.0025 is barely 3 sigma; no gain is defensible on one seed.
+2. **A real code action space.** The agent selects among curated hypotheses over an existing
+   trainer rather than writing Python. This is the largest gap against the brief.
+3. **Unbiased validation** against the randomised-exposure log (already exposed by the loader).
+4. **Censored watch-time regression.** `play_time_ms` is loaded and still unused as a target.
 
 ---
 
