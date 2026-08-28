@@ -1,5 +1,5 @@
 """
-KuaiRand-Pure Data Loader with strict date-based splitting.
+KuaiRand-Pure Data Loader with strict date-based splitting and rich 12-signal feedback extraction.
 """
 import os
 import csv
@@ -13,7 +13,6 @@ SPLITS = {
     'test':  (20220429, 20220508)
 }
 
-# 13 CWM Feature Fields
 USER_FE = ['follow_user_num_range', 'register_days_range', 'fans_user_num_range',
            'friend_user_num_range', 'user_active_degree']
 VID_FE = ['author_id', 'music_id', 'video_type', 'upload_type']
@@ -33,12 +32,11 @@ def find_data_dir(candidate_dirs: Optional[List[str]] = None) -> str:
 
 def load_kuairand(data_dir: Optional[str] = None, include_extra_features: bool = False) -> Dict[str, List]:
     """
-    Loads KuaiRand interaction logs and splits them strictly by date.
-    Returns: dict mapping split name ('train', 'valid', 'test') to list of rows.
+    Loads KuaiRand interaction logs with all 12 feedback signals.
     """
     actual_dir = data_dir if (data_dir and os.path.exists(data_dir)) else find_data_dir()
     
-    # 1. Load video features if available
+    # 1. Load video features
     vid2info = {}
     vid_path = os.path.join(actual_dir, 'video_features_basic_pure.csv')
     if os.path.exists(vid_path):
@@ -46,7 +44,7 @@ def load_kuairand(data_dir: Optional[str] = None, include_extra_features: bool =
             for r in csv.DictReader(fh):
                 vid2info[r['video_id']] = [r.get(k, 'UNK') for k in VID_FE]
 
-    # 2. Load user features if available
+    # 2. Load user features
     u2info = {}
     user_path = os.path.join(actual_dir, 'user_features_pure.csv')
     if os.path.exists(user_path) and include_extra_features:
@@ -68,15 +66,19 @@ def load_kuairand(data_dir: Optional[str] = None, include_extra_features: bool =
                 video_id = r['video_id']
                 tab = r.get('tab', '1')
                 duration_ms = float(r.get('duration_ms', 0.0))
+                play_time_ms = float(r.get('play_time_ms', 0.0))
                 label = 1 if r.get(LABEL, '0') != '0' else 0
                 
-                # Basic author_id
                 vinfo = vid2info.get(video_id, ['UNK'] * len(VID_FE))
                 author_id = vinfo[0] if vinfo else 'UNK'
                 
-                # Multi-task auxiliary labels (if present)
-                click = 1 if r.get('is_click', r.get('click', '0')) != '0' else 0
-                like = 1 if r.get('is_like', r.get('like', '0')) != '0' else 0
+                # Extract rich multi-feedback signals
+                click = 1 if r.get('is_click', '0') != '0' else 0
+                like = 1 if r.get('is_like', '0') != '0' else 0
+                follow = 1 if r.get('is_follow', '0') != '0' else 0
+                comment = 1 if r.get('is_comment', '0') != '0' else 0
+                forward = 1 if r.get('is_forward', '0') != '0' else 0
+                is_rand = 1 if r.get('is_rand', '0') != '0' else 0
                 
                 row_data = {
                     'date': date,
@@ -85,9 +87,14 @@ def load_kuairand(data_dir: Optional[str] = None, include_extra_features: bool =
                     'author_id': author_id,
                     'tab': tab,
                     'duration_ms': duration_ms,
+                    'play_time_ms': play_time_ms,
                     'label': label,
                     'click': click,
                     'like': like,
+                    'follow': follow,
+                    'comment': comment,
+                    'forward': forward,
+                    'is_rand': is_rand,
                     'v_extra': vinfo[1:] if len(vinfo) > 1 else [],
                     'u_extra': u2info.get(user_id, ['UNK'] * len(USER_FE)) if include_extra_features else []
                 }
@@ -98,4 +105,3 @@ def load_kuairand(data_dir: Optional[str] = None, include_extra_features: bool =
         out[name] = [x for x in rows if lo <= x['date'] <= hi]
         
     return out
-

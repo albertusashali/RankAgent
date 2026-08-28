@@ -33,10 +33,10 @@ graph TD
     B --> C["Stage 3: Feature Engineering (pipeline/features.py)<br/>(Target encoding, history aggregations, crossing)"]
     C --> D["Stage 4: Architecture & Multi-Task Design (pipeline/models.py)<br/>(FM, DeepFM, DCN-v2, MMoE, Censored Regression)"]
     D --> E["Stage 5: Train, Tune & Evaluate (pipeline/train.py)<br/>(GAUC & nDCG@5 calculation via evaluate.py)"]
-    E --> F{"Convergence Check<br/>(Δ ≤ 0.002 over 3 iters OR 50 iters / 6h)"}
-    F -- "Not Converged" --> G["Reflect & Revise (Tree Search & Backtracking)<br/>(Analyze failure/delta, formulate new hypothesis)"]
+    E --> F{"Convergence Check<br/>(Delta <= 0.002 over 3 iters OR 50 iters / 6h)"}
+    F -->|"Not Converged"| G["Reflect & Revise (Tree Search & Backtracking)<br/>(Analyze failure/delta, formulate new hypothesis)"]
     G --> C
-    F -- "Converged / Cap" --> H["Final Submission Packaging (pipeline/submit.py)<br/>(Generate validation-best submission.csv with row_id)"]
+    F -->|"Converged / Cap"| H["Final Submission Packaging (pipeline/submit.py)<br/>(Generate validation-best submission.csv with row_id)"]
 ```
 
 ---

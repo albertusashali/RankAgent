@@ -12,44 +12,48 @@
 
 ```mermaid
 graph TD
-    subgraph "MEMBER 1: Tree Search Orchestrator & State Machine"
-        ORCH["Orchestrator Controller<br/>State Machine: INIT -> HYPOTHESIZE -> GENERATE -> RUN -> EVAL -> REFLECT/PRUNE"]
-        TREE["Tree Manager & Backtracker<br/>(Best-First / Beam Search with Non-Linear Branching)"]
-        CONV["Convergence Detector<br/>(Tracks Global Best: Δ ≤ 0.002 over 3 iters)"]
+    subgraph S1["MEMBER 1: Tree Search Orchestrator & State Machine"]
+        ORCH["FSM Controller & Tree Manager<br/>(INIT - HYPOTHESIZE - RUN - EVAL - PRUNE)"]
+        CONV["Convergence Detector<br/>(Checks delta <= 0.002 over 3 iters)"]
     end
 
-    subgraph "MEMBER 3: Prompt Engine & RecSys Domain KB"
-        KB["KuaiRand KB & Strategy Bank<br/>(long_view, 12 Feedback Signals, MMoE, CWM Duration Bias)"]
-        PROMPTS["Strict Prompt Templates<br/>(Hypothesis Gen, Code Patching, Self-Healing)"]
+    subgraph S2["MEMBER 3: Prompt Engine & Domain KB"]
+        KB["KuaiRand Domain Playbook<br/>(Multi-Task Feedback, Duration Bias, Attention)"]
+        PROMPTS["Prompt Generator<br/>(Injects history & formats code commands)"]
     end
 
-    subgraph "MEMBER 2: Execution Sandbox & Telemetry Engine"
-        RUNNER["Subprocess Runner<br/>(Timeout Handler: 6h ceiling / 15m trial)"]
-        PARSER["Regex Output Parser<br/>(Extracts [EVAL] GAUC, nDCG@5 from evaluate.py)"]
-        DEBUGGER["Self-Healing Debugger<br/>(Traceback Analyzer & Max 3 Retries)"]
-        LOGGER["Iteration Telemetry Logger<br/>(Writes to run_summary.json / run_log.md)"]
+    subgraph S3["MEMBER 2: Execution Sandbox & Telemetry Engine"]
+        RUNNER["Subprocess Sandbox<br/>(15-min timeout guard / isolated process)"]
+        PARSER["Regex Output Parser<br/>(Extracts GAUC & nDCG@5 from eval output)"]
+        DEBUGGER["Self-Healing Debugger<br/>(Traceback repair, max 3 retries)"]
+        LOGGER["Telemetry Writer<br/>(Writes run_summary.json & run_log.md)"]
     end
 
-    subgraph "MEMBER 4: Modular Target Pipeline (pipeline/)"
-        DATA["pipeline/data.py<br/>(Date Splits: Train 0408-0421, Val 0422-0428)"]
-        FEAT["pipeline/features.py<br/>(12 Signals, Target Encodings, Cross Features)"]
-        MODELS["pipeline/models.py<br/>(FM -> GBDT -> DeepFM -> DCN-v2 -> MMoE/PLE)"]
-        TRAIN["pipeline/train.py<br/>(Loss Balancing, Gradient Accumulation)"]
-        EVAL["pipeline/evaluate.py<br/>(Official Starter Kit GAUC & nDCG@5)"]
-        SUBMIT["pipeline/submit.py<br/>(Strict row_id Exporter & Checker)"]
+    subgraph S4["MEMBER 4: Modular Target Pipeline (pipeline/)"]
+        DATA["pipeline/data.py & features.py<br/>(Date Splits & Feature Encodings)"]
+        MODELS["pipeline/models.py<br/>(FM, DeepFM, Multi-Task MMoE, DIN)"]
+        TRAIN["pipeline/train.py & evaluate.py<br/>(Training loop & Metric Scoring)"]
+        SUBMIT["pipeline/submit.py<br/>(Strict row_id submission exporter)"]
     end
 
-    ORCH --> KB
+    ORCH -->|1. Request Next Hypothesis| KB
     KB --> PROMPTS
-    PROMPTS --> RUNNER
-    RUNNER --> DATA & FEAT & MODELS & TRAIN
-    TRAIN --> EVAL
-    EVAL --> PARSER
-    PARSER --> CONV
-    PARSER --> LOGGER
-    RUNNER -- "Exception / Error" --> DEBUGGER
-    DEBUGGER --> PROMPTS
-    CONV -- "On Halt" --> SUBMIT
+    PROMPTS -->|2. Dispatch Command| RUNNER
+    
+    RUNNER -->|3. Run Training| TRAIN
+    DATA -->|Feed Data| TRAIN
+    MODELS -->|Instantiate Model| TRAIN
+    
+    TRAIN -->|4. Output Metrics| PARSER
+    PARSER -->|5. Save Telemetry| LOGGER
+    PARSER -->|6. Send Scores| CONV
+    
+    CONV -->|"7. Feedback Loop: Next Iteration (Not Converged)"| ORCH
+    
+    RUNNER -.->|"Exception or Error"| DEBUGGER
+    DEBUGGER -.->|"Patch and Retry"| RUNNER
+    
+    CONV -->|"Halted: Converged or Max Iters"| SUBMIT
 ```
 
 ---

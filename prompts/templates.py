@@ -13,32 +13,38 @@ Baseline Reference:
 
 {RECSYS_KB}
 
+Available CLI Options in `pipeline.train`:
+- `--model`: choices = ['fm', 'deepfm', 'mmoe', 'din', 'lgb', 'ensemble']
+- `--embed_dim`: embedding vector dimension (16, 32, 64)
+- `--experts`: number of MMoE experts (4, 6, 8, 12)
+- `--lr`: learning rate (0.0003, 0.0005, 0.001, 0.003)
+- `--epochs`: number of epochs (5, 10, 15, 20)
+- `--trees`: number of LightGBM trees (100, 150, 300)
+- `--cwm`: include 13 CWM metadata domains
+- `--weight_ensemble`: weight for neural model in ensemble (0.50, 0.65, 0.80)
+
 Rules:
-1. Propose concrete, scientifically grounded hypotheses from RecSys literature.
-2. Target specific files in the modular pipeline: `pipeline/features.py`, `pipeline/models.py`, or `pipeline/train.py`.
-3. Never modify `pipeline/data.py` splits or `pipeline/evaluate.py` evaluation rules.
-4. Output valid, executable Python code that runs seamlessly on both CPU and GPU (using device-agnostic PyTorch `device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')`).
+1. Propose concrete, scientifically grounded hypotheses that build upon previous best scores.
+2. Formulate the exact execution command using `python -m pipeline.train ...` with chosen arguments.
+3. If an approach failed (REJECTED), do not repeat it with identical parameters. Propose an orthogonal improvement or tune the current winning architecture.
 """
 
 HYPOTHESIS_PROMPT = """
 Current Iteration: {iteration_id}
-Best Validation Primary Score so far: {best_score:.4f} (Δ Baseline: {delta:+.4f})
+Global Best Validation Primary Score so far: {best_score:.4f} (Δ Baseline: {delta:+.4f})
 Recent Exploration History:
 {history_summary}
 
-Based on the RecSys domain playbook and past results, propose the next research hypothesis.
-Select a stage: ["Feature Engineering", "Architecture", "Multi-Task", "Loss Function", "Ensembling", "Hyperparameter Tuning"].
-
-Target File to modify: {target_file}
+Based on the RecSys domain playbook and past results, propose the next research hypothesis and execution command.
 
 Provide your response in JSON format matching the schema:
-{
-  "stage": "...",
-  "hypothesis": "...",
-  "target_file": "pipeline/...",
-  "rationale": "...",
-  "code_changes": "Full modified code for the target file"
-}
+{{
+  "stage": "Architecture / Hyperparameter Tuning / Multi-Task / Ensembling / Feature Engineering",
+  "hypothesis": "Clear scientific hypothesis of why this will improve ranking",
+  "target_file": "pipeline/models.py or pipeline/train.py",
+  "execution_command": "python -m pipeline.train --model ... [arguments]",
+  "rationale": "Why this specific configuration beats previous attempts"
+}}
 """
 
 DEBUGGER_PROMPT = """
@@ -58,7 +64,4 @@ Fix this error by providing the complete corrected code for {target_file}.
 Make sure:
 1. PyTorch tensor shapes match across layers.
 2. Tensor devices (`.to(device)`) are consistent.
-3. Out-of-memory errors are handled via gradient accumulation or reduced batch size.
-4. Return ONLY valid Python code for the target file.
 """
-

@@ -2,8 +2,9 @@
 Recommendation Model Architectures for KuaiRand.
 Includes:
 - Official NumPy Factorization Machine (FM) Baseline
-- PyTorch DeepFM (1st + 2nd order + Deep MLP + Dense Historical Features)
-- PyTorch MMoE (Multi-gate Mixture-of-Experts)
+- PyTorch DeepFM (1st + 2nd order + Deep MLP)
+- PyTorch MMoE (Multi-gate Mixture-of-Experts for Multi-Task Learning)
+- PyTorch DIN (Deep Interest Network with Target Attention Pooling)
 Supports dynamic CPU / NVIDIA CUDA GPU execution.
 """
 import numpy as np
@@ -73,37 +74,22 @@ class NumpyFM:
 
 
 # =========================================================================
-# 2. PyTorch DeepFM (Linear + 2nd-order FM + Dense Historical Stats + Deep MLP)
+# 2. PyTorch DeepFM (Linear + 2nd-order FM + Deep MLP)
 # =========================================================================
 class DeepFM(nn.Module):
-    def __init__(self, num_features: int, num_fields: int, dense_dim: int = 0, embed_dim: int = 16, hidden_dims: List[int] = [128, 64], dropout: float = 0.2):
+    def __init__(self, num_features: int, num_fields: int, embed_dim: int = 16, hidden_dims: List[int] = [128, 64], dropout: float = 0.2):
         super().__init__()
         self.num_fields = num_fields
         self.embed_dim = embed_dim
-        self.dense_dim = dense_dim
         
-        # 1st order linear weights & bias
         self.linear_embeddings = nn.Embedding(num_features, 1)
         self.bias = nn.Parameter(torch.zeros(1))
         
-        # 2nd order factor embeddings
         self.factor_embeddings = nn.Embedding(num_features, embed_dim)
         nn.init.normal_(self.factor_embeddings.weight, std=0.01)
         nn.init.zeros_(self.linear_embeddings.weight)
         
-        # Dense feature linear projection if present
-        if dense_dim > 0:
-            self.dense_proj = nn.Sequential(
-                nn.Linear(dense_dim, 32),
-                nn.BatchNorm1d(32),
-                nn.ReLU()
-            )
-            input_dim = num_fields * embed_dim + 32
-        else:
-            self.dense_proj = None
-            input_dim = num_fields * embed_dim
-        
-        # Deep MLP
+        input_dim = num_fields * embed_dim
         layers = []
         for h_dim in hidden_dims:
             layers.append(nn.Linear(input_dim, h_dim))
@@ -114,25 +100,15 @@ class DeepFM(nn.Module):
         layers.append(nn.Linear(input_dim, 1))
         self.mlp = nn.Sequential(*layers)
 
-    def forward(self, x_cat: torch.Tensor, x_dense: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # 1. Linear part
+    def forward(self, x_cat: torch.Tensor) -> torch.Tensor:
         linear_part = self.linear_embeddings(x_cat).sum(dim=1) + self.bias
-        
-        # 2. FM 2nd order interaction
-        vx = self.factor_embeddings(x_cat)  # (batch, num_fields, embed_dim)
+        vx = self.factor_embeddings(x_cat)
         sum_vx = vx.sum(dim=1)
         sum_vx_sq = (vx ** 2).sum(dim=1)
         fm_part = 0.5 * (sum_vx ** 2 - sum_vx_sq).sum(dim=1, keepdim=True)
         
-        # 3. Deep MLP part
         deep_emb = vx.view(vx.size(0), -1)
-        if self.dense_proj is not None and x_dense is not None:
-            dense_feat = self.dense_proj(x_dense)
-            deep_input = torch.cat([deep_emb, dense_feat], dim=1)
-        else:
-            deep_input = deep_emb
-            
-        deep_part = self.mlp(deep_input)
+        deep_part = self.mlp(deep_emb)
         logits = linear_part + fm_part + deep_part
         return torch.sigmoid(logits).squeeze(1)
 
@@ -173,14 +149,88 @@ class MMoE(nn.Module):
             ) for _ in range(num_tasks)
         ])
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, ...]:
-        vx = self.factor_embeddings(x).view(x.size(0), -1)
-        expert_outputs = torch.stack([exp(vx) for exp in self.experts], dim=1)
+    def forward(self, x_cat: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+        input_rep = self.factor_embeddings(x_cat).view(x_cat.size(0), -1)
+        expert_outputs = torch.stack([exp(input_rep) for exp in self.experts], dim=1)
         
         task_outputs = []
-        for gate, tower in zip(self.gates, self.towers):
-            gate_weights = gate(vx).unsqueeze(1)
+        for i in range(len(self.towers)):
+            gate_weights = self.gates[i](input_rep).unsqueeze(1)
             task_rep = torch.bmm(gate_weights, expert_outputs).squeeze(1)
-            task_outputs.append(tower(task_rep).squeeze(1))
+            task_outputs.append(self.towers[i](task_rep).squeeze(1))
             
         return tuple(task_outputs)
+
+
+# =========================================================================
+# 4. PyTorch DIN (Deep Interest Network with Target Attention Pooling)
+# =========================================================================
+class DIN(nn.Module):
+    def __init__(self, num_features: int, num_fields: int, num_vids: int, embed_dim: int = 16, hidden_dims: List[int] = [128, 64], dropout: float = 0.15):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_fields = num_fields
+        
+        # Categorical feature embeddings
+        self.factor_embeddings = nn.Embedding(num_features, embed_dim)
+        nn.init.normal_(self.factor_embeddings.weight, std=0.01)
+        
+        # Item sequential embedding table (index 0 is padding)
+        self.item_embeddings = nn.Embedding(num_vids, embed_dim, padding_idx=0)
+        nn.init.normal_(self.item_embeddings.weight, std=0.01)
+        
+        # Attention Unit MLP: [cand, hist, cand - hist, cand * hist] -> 4 * embed_dim -> 1
+        self.attention_mlp = nn.Sequential(
+            nn.Linear(4 * embed_dim, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1)
+        )
+        
+        # Prediction MLP
+        input_dim = num_fields * embed_dim + embed_dim  # Base categorical fields + Attention Pooled History
+        layers = []
+        for h_dim in hidden_dims:
+            layers.append(nn.Linear(input_dim, h_dim))
+            layers.append(nn.BatchNorm1d(h_dim))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(dropout))
+            input_dim = h_dim
+        layers.append(nn.Linear(input_dim, 1))
+        self.mlp = nn.Sequential(*layers)
+
+    def forward(self, x_cat: torch.Tensor, x_hist: torch.Tensor) -> torch.Tensor:
+        # x_cat: (B, num_fields)
+        # x_hist: (B, seq_len)
+        base_emb = self.factor_embeddings(x_cat).view(x_cat.size(0), -1)  # (B, num_fields * embed_dim)
+        
+        # Candidate item embedding: video_id is field 1
+        cand_emb = self.factor_embeddings(x_cat[:, 1])  # (B, embed_dim)
+        
+        # History embeddings
+        hist_emb = self.item_embeddings(x_hist)  # (B, seq_len, embed_dim)
+        
+        # Expand candidate embedding across sequence
+        cand_expanded = cand_emb.unsqueeze(1).expand_as(hist_emb)  # (B, seq_len, embed_dim)
+        
+        # Attention features: [cand, hist, cand - hist, cand * hist]
+        att_feat = torch.cat([
+            cand_expanded,
+            hist_emb,
+            cand_expanded - hist_emb,
+            cand_expanded * hist_emb
+        ], dim=-1)  # (B, seq_len, 4 * embed_dim)
+        
+        att_weights = self.attention_mlp(att_feat)  # (B, seq_len, 1)
+        
+        # Mask out padding (index 0)
+        mask = (x_hist != 0).unsqueeze(-1)  # (B, seq_len, 1)
+        att_weights = att_weights.masked_fill(~mask, -1e9)
+        att_weights = F.softmax(att_weights, dim=1)  # (B, seq_len, 1)
+        
+        # Attention pooled interest representation
+        user_interest = (att_weights * hist_emb).sum(dim=1)  # (B, embed_dim)
+        
+        # Concat base features + dynamic interest vector
+        full_rep = torch.cat([base_emb, user_interest], dim=1)
+        logits = self.mlp(full_rep)
+        return torch.sigmoid(logits).squeeze(1)
