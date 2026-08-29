@@ -50,7 +50,7 @@ class RunLogger:
         """The working-tree diff at this moment, as the agent left it."""
         try:
             out = subprocess.run(["git", "diff", "--unified=3"], capture_output=True,
-                                 text=True, timeout=20)
+                                 text=True, encoding="utf-8", errors="replace", timeout=20)
             diff = out.stdout or ""
         except Exception as exc:
             return f"(diff unavailable: {exc})"
