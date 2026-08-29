@@ -33,7 +33,9 @@ data/
 *.zip
 *.tar.gz
 *.parquet
-KuaiRand*/
+data/KuaiRand*/
+!kuairand-starter-kit/
+!kuairand-starter-kit/**
 
 # Model Weights, Embeddings & Checkpoints
 *.pt

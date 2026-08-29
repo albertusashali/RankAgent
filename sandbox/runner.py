@@ -26,6 +26,8 @@ class ExecutionRunner:
         env = os.environ.copy()
         env['PYTHONPATH'] = os.path.abspath(self.cwd)
         env['PYTHONUNBUFFERED'] = '1'
+        env['PYTHONIOENCODING'] = 'utf-8'
+        env['PYTHONUTF8'] = '1'
         # Belt and braces: the hidden-test seal is enforced in the loader, and the
         # variable that would lift it is explicitly cleared for every trial.
         env.pop('RANKAGENT_UNSEAL_TEST', None)
@@ -36,7 +38,9 @@ class ExecutionRunner:
         proc = None
         try:
             proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE, text=True, env=env, cwd=self.cwd)
+                                    stderr=subprocess.PIPE, text=True,
+                                    encoding='utf-8', errors='replace',
+                                    env=env, cwd=self.cwd)
             stdout, stderr = proc.communicate(timeout=self.timeout_seconds)
             elapsed = time.time() - t0
 

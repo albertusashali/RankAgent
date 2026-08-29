@@ -10,6 +10,7 @@ def main():
     parser.add_argument("--data_dir", default=None, help="Path to KuaiRand-Pure dataset directory (optional, auto-detected)")
     parser.add_argument("--max_iterations", type=int, default=None, help="Iteration budget (default: configs/benchmark_kuairand.yaml, hard cap 50)")
     parser.add_argument("--max_wall_clock", type=int, default=None, help="Wall-clock ceiling in seconds (default: configs/benchmark_kuairand.yaml, 6h)")
+    parser.add_argument("--run_baseline", action="store_true", help="Explicitly re-train the Factorization Machine baseline before starting iterations")
     args = parser.parse_args()
 
     print("==================================================================")
@@ -19,7 +20,8 @@ def main():
     agent = RankAgentOrchestrator(
         data_dir=args.data_dir,
         max_iterations=args.max_iterations,
-        max_wall_clock=args.max_wall_clock
+        max_wall_clock=args.max_wall_clock,
+        run_baseline=args.run_baseline
     )
     agent.start_loop()
 

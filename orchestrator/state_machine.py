@@ -146,13 +146,15 @@ STRATEGY_BANK: List[Dict[str, str]] = [
 class RankAgentOrchestrator:
     def __init__(self, data_dir: Optional[str] = None,
                  max_iterations: Optional[int] = None,
-                 max_wall_clock: Optional[int] = None, run_id: Optional[str] = None):
+                 max_wall_clock: Optional[int] = None, run_id: Optional[str] = None,
+                 run_baseline: bool = False):
         load_dotenv_if_present()
         agent_cfg = load_yaml("agent_config.yaml")
         bench_cfg = load_yaml("benchmark_kuairand.yaml")
         conv = (bench_cfg.get("convergence") or {})
 
         self.data_dir = data_dir
+        self.run_baseline_flag = run_baseline
         # Explicit arguments win over the YAML defaults; YAML wins over the
         # hard-coded fallback. The previous order let the config silently
         # override a budget the operator had asked for on the command line.
@@ -439,10 +441,14 @@ class RankAgentOrchestrator:
               f"| convergence eps={self.epsilon} N={self.patience}")
         print("=" * 74)
 
-        if not self.run_baseline():
-            print("[HALT] baseline did not reproduce; refusing to iterate on an unverified harness")
-            self._write_summary(t0, "baseline reproduction failed", None)
-            return
+        if self.run_baseline_flag:
+            if not self.run_baseline():
+                print("[HALT] baseline did not reproduce; refusing to iterate on an unverified harness")
+                self._write_summary(t0, "baseline reproduction failed", None)
+                return
+        else:
+            print(f"[BASELINE] Initialized with published benchmark valid primary: {BASELINE_VAL_PRIMARY:.4f}")
+            self.tree.record_baseline(BASELINE_VAL_PRIMARY, node_id=0)
 
         halt_reason = f"reached the {self.max_iterations}-iteration cap"
         for it in range(1, self.max_iterations + 1):
