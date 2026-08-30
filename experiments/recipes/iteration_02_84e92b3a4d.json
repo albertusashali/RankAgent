@@ -1,0 +1,14 @@
+{
+  "name": "affinity_balanced",
+  "base_profile": "affinity",
+  "include_features": null,
+  "exclude_features": [],
+  "item_smoothing": 15.0,
+  "cross_smoothing": 8.0,
+  "global_prior_strength": 50.0,
+  "completion_ratio_clip": 5.0,
+  "recency_cap_days": 30,
+  "use_rank_selection": true,
+  "min_within_user_variance": 1e-10,
+  "recipe_id": "84e92b3a4d"
+}

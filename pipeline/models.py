@@ -44,13 +44,17 @@ def _segment_logsumexp(scores: torch.Tensor, group: torch.Tensor, n_groups: int)
 
 def pointwise_bce(logits: torch.Tensor, labels: torch.Tensor,
                   group: Optional[torch.Tensor] = None,
-                  n_groups: int = 0) -> torch.Tensor:
+                  n_groups: int = 0,
+                  sample_weight: Optional[torch.Tensor] = None) -> torch.Tensor:
     """Per-impression binary cross-entropy. The original objective."""
-    return F.binary_cross_entropy_with_logits(logits, labels)
+    loss = F.binary_cross_entropy_with_logits(logits, labels, reduction='none')
+    return ((loss * sample_weight).sum() / sample_weight.sum().clamp_min(1e-12)
+            if sample_weight is not None else loss.mean())
 
 
 def listwise_softmax(logits: torch.Tensor, labels: torch.Tensor,
-                     group: torch.Tensor, n_groups: int) -> torch.Tensor:
+                     group: torch.Tensor, n_groups: int,
+                     sample_weight: Optional[torch.Tensor] = None) -> torch.Tensor:
     """Within-user softmax cross-entropy (ListNet-style).
 
     The metrics are *within-user* ranking metrics, so the natural objective is a
@@ -64,11 +68,16 @@ def listwise_softmax(logits: torch.Tensor, labels: torch.Tensor,
     pos = labels > 0.5
     if not bool(pos.any()):
         return logits.sum() * 0.0
-    return -(log_prob[pos]).mean()
+    loss = -log_prob[pos]
+    if sample_weight is not None:
+        w = sample_weight[pos]
+        return (loss * w).sum() / w.sum().clamp_min(1e-12)
+    return loss.mean()
 
 
 def bpr_pairwise(logits: torch.Tensor, labels: torch.Tensor,
-                 group: torch.Tensor, n_groups: int) -> torch.Tensor:
+                 group: torch.Tensor, n_groups: int,
+                 sample_weight: Optional[torch.Tensor] = None) -> torch.Tensor:
     """Bayesian Personalised Ranking over within-user positive/negative pairs.
 
     For each group, pair every positive against a randomly chosen negative from
@@ -92,13 +101,66 @@ def bpr_pairwise(logits: torch.Tensor, labels: torch.Tensor,
     if not bool(keep.any()):
         return logits.sum() * 0.0
     margin = logits[pos_positions[keep]] - logits[partner[keep]]
-    return -F.logsigmoid(margin).mean()
+    loss = -F.logsigmoid(margin)
+    if sample_weight is not None:
+        w = sample_weight[pos_positions[keep]]
+        return (loss * w).sum() / w.sum().clamp_min(1e-12)
+    return loss.mean()
+
+
+def lambda_ndcg_pairwise(logits: torch.Tensor, labels: torch.Tensor,
+                         group: torch.Tensor, n_groups: int,
+                         cutoff: int = 5,
+                         sample_weight: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Sampled LambdaLoss-style pairwise objective weighted by delta-nDCG.
+
+    Each positive is paired with a negative from the same user. Pair gradients
+    are weighted by the absolute change in nDCG if their current predicted ranks
+    were swapped, focusing capacity on mistakes near the scored top-5 positions.
+    """
+    losses = []
+    for gid in range(n_groups):
+        idx = torch.nonzero(group == gid, as_tuple=True)[0]
+        if idx.numel() < 2:
+            continue
+        y, s = labels[idx], logits[idx]
+        pos = torch.nonzero(y > 0.5, as_tuple=True)[0]
+        neg = torch.nonzero(y <= 0.5, as_tuple=True)[0]
+        if not (pos.numel() and neg.numel()):
+            continue
+        partner = neg[torch.randint(neg.numel(), (pos.numel(),), device=logits.device)]
+        order = torch.argsort(s, descending=True)
+        ranks = torch.empty_like(order)
+        ranks[order] = torch.arange(order.numel(), device=logits.device)
+        rp, rn = ranks[pos], ranks[partner]
+        dp = torch.where(rp < cutoff, 1.0 / torch.log2(rp.float() + 2.0), torch.zeros_like(rp, dtype=s.dtype))
+        dn = torch.where(rn < cutoff, 1.0 / torch.log2(rn.float() + 2.0), torch.zeros_like(rn, dtype=s.dtype))
+        ideal_len = min(int(pos.numel()), cutoff)
+        ideal = torch.arange(ideal_len, device=logits.device, dtype=s.dtype)
+        idcg = (1.0 / torch.log2(ideal + 2.0)).sum().clamp_min(1e-12)
+        delta = (dp - dn).abs() / idcg
+        pair_weight = delta * (sample_weight[idx[pos]] if sample_weight is not None else 1.0)
+        losses.append((-F.logsigmoid(s[pos] - s[partner]) * pair_weight).sum() /
+                      torch.as_tensor(pair_weight).sum().clamp_min(1e-12))
+    return torch.stack(losses).mean() if losses else logits.sum() * 0.0
+
+
+def hybrid_ranking_loss(logits: torch.Tensor, labels: torch.Tensor,
+                        group: torch.Tensor, n_groups: int,
+                        auc_weight: float = 0.5, cutoff: int = 5,
+                        sample_weight: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Blend GAUC-oriented BPR and top-heavy delta-nDCG pairwise learning."""
+    return (auc_weight * bpr_pairwise(logits, labels, group, n_groups, sample_weight) +
+            (1.0 - auc_weight) *
+            lambda_ndcg_pairwise(logits, labels, group, n_groups, cutoff=cutoff,
+                                 sample_weight=sample_weight))
 
 
 LOSSES = {
     'pointwise': pointwise_bce,
     'listwise': listwise_softmax,
     'bpr': bpr_pairwise,
+    'hybrid': hybrid_ranking_loss,
 }
 
 
@@ -151,6 +213,38 @@ class DeepFM(nn.Module):
         vx = self.factors(x_cat)
         inter = 0.5 * ((vx.sum(1) ** 2) - (vx ** 2).sum(1)).sum(1)
         deep = self.mlp(vx.flatten(1)).squeeze(1)
+        return self.linear(x_cat).sum((1, 2)) + self.bias + inter + deep
+
+
+class DenseDeepFM(nn.Module):
+    """DeepFM fused with causal numerical signals for within-user ranking.
+
+    Identity embeddings learn memorised user/item interactions; the dense tower
+    learns smooth historical affinity, recency and completion effects and can
+    generalise to sparse or unseen ids.  LayerNorm keeps count and rate feature
+    scales from overwhelming the embedding branch.
+    """
+
+    def __init__(self, num_features: int, num_fields: int, num_dense: int,
+                 embed_dim: int = 16, hidden_dim: int = 96, dropout: float = 0.15):
+        super().__init__()
+        self.linear = nn.Embedding(num_features, 1)
+        self.factors = nn.Embedding(num_features, embed_dim)
+        self.bias = nn.Parameter(torch.zeros(1))
+        nn.init.zeros_(self.linear.weight)
+        nn.init.normal_(self.factors.weight, std=0.01)
+        self.dense_tower = nn.Sequential(
+            nn.LayerNorm(num_dense), nn.Linear(num_dense, 64), nn.ReLU(),
+            nn.Dropout(dropout), nn.Linear(64, 32), nn.ReLU())
+        self.fusion = nn.Sequential(
+            nn.Linear(num_fields * embed_dim + 32, hidden_dim), nn.ReLU(),
+            nn.Dropout(dropout), nn.Linear(hidden_dim, 1))
+
+    def forward(self, x_cat: torch.Tensor, x_dense: torch.Tensor) -> torch.Tensor:
+        vx = self.factors(x_cat)
+        inter = 0.5 * ((vx.sum(1) ** 2) - (vx ** 2).sum(1)).sum(1)
+        dense_rep = self.dense_tower(x_dense)
+        deep = self.fusion(torch.cat([vx.flatten(1), dense_rep], dim=1)).squeeze(1)
         return self.linear(x_cat).sum((1, 2)) + self.bias + inter + deep
 
 

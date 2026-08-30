@@ -1,0 +1,558 @@
+{
+  "static_audit": {
+    "status": "PASS",
+    "feature_count": 28,
+    "duplicates": [],
+    "missing_manifests": [],
+    "stale_manifests": [],
+    "unsafe_current_row_features": [],
+    "forbidden_current_row_sources": [
+      "click",
+      "comment",
+      "follow",
+      "forward",
+      "is_profile_enter",
+      "label",
+      "like",
+      "long_view",
+      "play_time_ms"
+    ]
+  },
+  "recipe_audit": {
+    "status": "PASS",
+    "recipe_id": "84e92b3a4d",
+    "recipe_name": "affinity_balanced",
+    "unknown_features": [],
+    "selected_features": [
+      "video_hist_count",
+      "video_hist_long_view_rate",
+      "video_hist_click_rate",
+      "author_hist_count",
+      "author_hist_long_view_rate",
+      "user_hist_count",
+      "user_hist_long_view_rate",
+      "log_duration",
+      "dur_bucket",
+      "dur_to_user_avg_ratio",
+      "completion_ratio_prior",
+      "user_video_affinity",
+      "user_author_affinity",
+      "user_durbucket_affinity",
+      "user_tab_affinity"
+    ]
+  },
+  "manifests": [
+    {
+      "name": "video_hist_count",
+      "family": "core",
+      "entity_keys": [
+        "video_id"
+      ],
+      "source_columns": [
+        "label",
+        "click",
+        "date"
+      ],
+      "availability": "historical_only",
+      "window_days": 0,
+      "smoothing": 15.0,
+      "fallback": "smoothed prior",
+      "expected_mechanism": "historical item quality or exposure support"
+    },
+    {
+      "name": "video_hist_long_view_rate",
+      "family": "core",
+      "entity_keys": [
+        "video_id"
+      ],
+      "source_columns": [
+        "label",
+        "click",
+        "date"
+      ],
+      "availability": "historical_only",
+      "window_days": 0,
+      "smoothing": 15.0,
+      "fallback": "smoothed prior",
+      "expected_mechanism": "historical item quality or exposure support"
+    },
+    {
+      "name": "video_hist_click_rate",
+      "family": "core",
+      "entity_keys": [
+        "video_id"
+      ],
+      "source_columns": [
+        "label",
+        "click",
+        "date"
+      ],
+      "availability": "historical_only",
+      "window_days": 0,
+      "smoothing": 15.0,
+      "fallback": "smoothed prior",
+      "expected_mechanism": "historical item quality or exposure support"
+    },
+    {
+      "name": "author_hist_count",
+      "family": "core",
+      "entity_keys": [
+        "video_id"
+      ],
+      "source_columns": [
+        "label",
+        "click",
+        "date"
+      ],
+      "availability": "historical_only",
+      "window_days": 0,
+      "smoothing": 15.0,
+      "fallback": "smoothed prior",
+      "expected_mechanism": "historical item quality or exposure support"
+    },
+    {
+      "name": "author_hist_long_view_rate",
+      "family": "core",
+      "entity_keys": [
+        "video_id"
+      ],
+      "source_columns": [
+        "label",
+        "click",
+        "date"
+      ],
+      "availability": "historical_only",
+      "window_days": 0,
+      "smoothing": 15.0,
+      "fallback": "smoothed prior",
+      "expected_mechanism": "historical item quality or exposure support"
+    },
+    {
+      "name": "user_hist_count",
+      "family": "core",
+      "entity_keys": [
+        "user_id"
+      ],
+      "source_columns": [
+        "label",
+        "duration_ms",
+        "date"
+      ],
+      "availability": "historical_only",
+      "window_days": 0,
+      "smoothing": 15.0,
+      "fallback": "smoothed prior",
+      "expected_mechanism": "conditions heterogeneous user behaviour"
+    },
+    {
+      "name": "user_hist_long_view_rate",
+      "family": "core",
+      "entity_keys": [
+        "user_id"
+      ],
+      "source_columns": [
+        "label",
+        "duration_ms",
+        "date"
+      ],
+      "availability": "historical_only",
+      "window_days": 0,
+      "smoothing": 15.0,
+      "fallback": "smoothed prior",
+      "expected_mechanism": "conditions heterogeneous user behaviour"
+    },
+    {
+      "name": "log_duration",
+      "family": "core",
+      "entity_keys": [
+        "user_id"
+      ],
+      "source_columns": [
+        "label",
+        "duration_ms",
+        "date"
+      ],
+      "availability": "historical_only",
+      "window_days": 0,
+      "smoothing": 15.0,
+      "fallback": "smoothed prior",
+      "expected_mechanism": "conditions heterogeneous user behaviour"
+    },
+    {
+      "name": "dur_bucket",
+      "family": "core",
+      "entity_keys": [
+        "user_id"
+      ],
+      "source_columns": [
+        "label",
+        "duration_ms",
+        "date"
+      ],
+      "availability": "historical_only",
+      "window_days": 0,
+      "smoothing": 15.0,
+      "fallback": "smoothed prior",
+      "expected_mechanism": "conditions heterogeneous user behaviour"
+    },
+    {
+      "name": "dur_to_user_avg_ratio",
+      "family": "core",
+      "entity_keys": [
+        "user_id"
+      ],
+      "source_columns": [
+        "label",
+        "duration_ms",
+        "date"
+      ],
+      "availability": "historical_only",
+      "window_days": 0,
+      "smoothing": 15.0,
+      "fallback": "smoothed prior",
+      "expected_mechanism": "conditions heterogeneous user behaviour"
+    },
+    {
+      "name": "completion_ratio_prior",
+      "family": "core",
+      "entity_keys": [
+        "user_id"
+      ],
+      "source_columns": [
+        "label",
+        "duration_ms",
+        "date"
+      ],
+      "availability": "historical_only",
+      "window_days": 0,
+      "smoothing": 15.0,
+      "fallback": "smoothed prior",
+      "expected_mechanism": "conditions heterogeneous user behaviour"
+    },
+    {
+      "name": "user_video_affinity",
+      "family": "affinity",
+      "entity_keys": [
+        "user_id",
+        "candidate entity"
+      ],
+      "source_columns": [
+        "label",
+        "date"
+      ],
+      "availability": "historical_only",
+      "window_days": 0,
+      "smoothing": 8.0,
+      "fallback": "smoothed prior",
+      "expected_mechanism": "candidate-varying personalized preference"
+    },
+    {
+      "name": "user_author_affinity",
+      "family": "affinity",
+      "entity_keys": [
+        "user_id",
+        "candidate entity"
+      ],
+      "source_columns": [
+        "label",
+        "date"
+      ],
+      "availability": "historical_only",
+      "window_days": 0,
+      "smoothing": 8.0,
+      "fallback": "smoothed prior",
+      "expected_mechanism": "candidate-varying personalized preference"
+    },
+    {
+      "name": "user_durbucket_affinity",
+      "family": "affinity",
+      "entity_keys": [
+        "user_id",
+        "candidate entity"
+      ],
+      "source_columns": [
+        "label",
+        "date"
+      ],
+      "availability": "historical_only",
+      "window_days": 0,
+      "smoothing": 8.0,
+      "fallback": "smoothed prior",
+      "expected_mechanism": "candidate-varying personalized preference"
+    },
+    {
+      "name": "user_tab_affinity",
+      "family": "affinity",
+      "entity_keys": [
+        "user_id",
+        "candidate entity"
+      ],
+      "source_columns": [
+        "label",
+        "date"
+      ],
+      "availability": "historical_only",
+      "window_days": 0,
+      "smoothing": 8.0,
+      "fallback": "smoothed prior",
+      "expected_mechanism": "candidate-varying personalized preference"
+    },
+    {
+      "name": "video_completion_logratio",
+      "family": "temporal",
+      "entity_keys": [
+        "user/item/author"
+      ],
+      "source_columns": [
+        "play_time_ms",
+        "duration_ms",
+        "label",
+        "date"
+      ],
+      "availability": "historical_only",
+      "window_days": 0,
+      "smoothing": 8.0,
+      "fallback": "smoothed prior",
+      "expected_mechanism": "recent interest, duration-debiased history, or preference momentum"
+    },
+    {
+      "name": "author_completion_logratio",
+      "family": "temporal",
+      "entity_keys": [
+        "user/item/author"
+      ],
+      "source_columns": [
+        "play_time_ms",
+        "duration_ms",
+        "label",
+        "date"
+      ],
+      "availability": "historical_only",
+      "window_days": 0,
+      "smoothing": 8.0,
+      "fallback": "smoothed prior",
+      "expected_mechanism": "recent interest, duration-debiased history, or preference momentum"
+    },
+    {
+      "name": "user_author_completion_logratio",
+      "family": "temporal",
+      "entity_keys": [
+        "user/item/author"
+      ],
+      "source_columns": [
+        "play_time_ms",
+        "duration_ms",
+        "label",
+        "date"
+      ],
+      "availability": "historical_only",
+      "window_days": 0,
+      "smoothing": 8.0,
+      "fallback": "smoothed prior",
+      "expected_mechanism": "recent interest, duration-debiased history, or preference momentum"
+    },
+    {
+      "name": "days_since_user_activity",
+      "family": "temporal",
+      "entity_keys": [
+        "user/item/author"
+      ],
+      "source_columns": [
+        "play_time_ms",
+        "duration_ms",
+        "label",
+        "date"
+      ],
+      "availability": "historical_only",
+      "window_days": 0,
+      "smoothing": 8.0,
+      "fallback": "smoothed prior",
+      "expected_mechanism": "recent interest, duration-debiased history, or preference momentum"
+    },
+    {
+      "name": "days_since_video_seen",
+      "family": "temporal",
+      "entity_keys": [
+        "user/item/author"
+      ],
+      "source_columns": [
+        "play_time_ms",
+        "duration_ms",
+        "label",
+        "date"
+      ],
+      "availability": "historical_only",
+      "window_days": 0,
+      "smoothing": 8.0,
+      "fallback": "smoothed prior",
+      "expected_mechanism": "recent interest, duration-debiased history, or preference momentum"
+    },
+    {
+      "name": "days_since_author_seen",
+      "family": "temporal",
+      "entity_keys": [
+        "user/item/author"
+      ],
+      "source_columns": [
+        "play_time_ms",
+        "duration_ms",
+        "label",
+        "date"
+      ],
+      "availability": "historical_only",
+      "window_days": 0,
+      "smoothing": 8.0,
+      "fallback": "smoothed prior",
+      "expected_mechanism": "recent interest, duration-debiased history, or preference momentum"
+    },
+    {
+      "name": "days_since_user_author_seen",
+      "family": "temporal",
+      "entity_keys": [
+        "user/item/author"
+      ],
+      "source_columns": [
+        "play_time_ms",
+        "duration_ms",
+        "label",
+        "date"
+      ],
+      "availability": "historical_only",
+      "window_days": 0,
+      "smoothing": 8.0,
+      "fallback": "smoothed prior",
+      "expected_mechanism": "recent interest, duration-debiased history, or preference momentum"
+    },
+    {
+      "name": "video_rate_3d",
+      "family": "temporal",
+      "entity_keys": [
+        "user/item/author"
+      ],
+      "source_columns": [
+        "play_time_ms",
+        "duration_ms",
+        "label",
+        "date"
+      ],
+      "availability": "historical_only",
+      "window_days": 3,
+      "smoothing": 8.0,
+      "fallback": "smoothed prior",
+      "expected_mechanism": "recent interest, duration-debiased history, or preference momentum"
+    },
+    {
+      "name": "video_rate_7d",
+      "family": "temporal",
+      "entity_keys": [
+        "user/item/author"
+      ],
+      "source_columns": [
+        "play_time_ms",
+        "duration_ms",
+        "label",
+        "date"
+      ],
+      "availability": "historical_only",
+      "window_days": 7,
+      "smoothing": 8.0,
+      "fallback": "smoothed prior",
+      "expected_mechanism": "recent interest, duration-debiased history, or preference momentum"
+    },
+    {
+      "name": "video_momentum_3d_vs_lifetime",
+      "family": "temporal",
+      "entity_keys": [
+        "user/item/author"
+      ],
+      "source_columns": [
+        "play_time_ms",
+        "duration_ms",
+        "label",
+        "date"
+      ],
+      "availability": "historical_only",
+      "window_days": 3,
+      "smoothing": 8.0,
+      "fallback": "smoothed prior",
+      "expected_mechanism": "recent interest, duration-debiased history, or preference momentum"
+    },
+    {
+      "name": "user_author_rate_3d",
+      "family": "temporal",
+      "entity_keys": [
+        "user/item/author"
+      ],
+      "source_columns": [
+        "play_time_ms",
+        "duration_ms",
+        "label",
+        "date"
+      ],
+      "availability": "historical_only",
+      "window_days": 3,
+      "smoothing": 8.0,
+      "fallback": "smoothed prior",
+      "expected_mechanism": "recent interest, duration-debiased history, or preference momentum"
+    },
+    {
+      "name": "user_author_rate_7d",
+      "family": "temporal",
+      "entity_keys": [
+        "user/item/author"
+      ],
+      "source_columns": [
+        "play_time_ms",
+        "duration_ms",
+        "label",
+        "date"
+      ],
+      "availability": "historical_only",
+      "window_days": 7,
+      "smoothing": 8.0,
+      "fallback": "smoothed prior",
+      "expected_mechanism": "recent interest, duration-debiased history, or preference momentum"
+    },
+    {
+      "name": "user_author_momentum_3d_vs_lifetime",
+      "family": "temporal",
+      "entity_keys": [
+        "user/item/author"
+      ],
+      "source_columns": [
+        "play_time_ms",
+        "duration_ms",
+        "label",
+        "date"
+      ],
+      "availability": "historical_only",
+      "window_days": 3,
+      "smoothing": 8.0,
+      "fallback": "smoothed prior",
+      "expected_mechanism": "recent interest, duration-debiased history, or preference momentum"
+    }
+  ],
+  "dynamic_audit": {
+    "status": "PASS",
+    "current_row_outcome_invariant": true,
+    "all_values_finite": true,
+    "features_checked": [
+      "video_hist_count",
+      "video_hist_long_view_rate",
+      "video_hist_click_rate",
+      "author_hist_count",
+      "author_hist_long_view_rate",
+      "user_hist_count",
+      "user_hist_long_view_rate",
+      "log_duration",
+      "dur_bucket",
+      "dur_to_user_avg_ratio",
+      "completion_ratio_prior",
+      "user_video_affinity",
+      "user_author_affinity",
+      "user_durbucket_affinity",
+      "user_tab_affinity"
+    ]
+  },
+  "status": "PASS"
+}

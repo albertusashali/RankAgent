@@ -49,8 +49,10 @@ class RunLogger:
     def capture_diff(self, max_chars: int = 8000) -> str:
         """The working-tree diff at this moment, as the agent left it."""
         try:
-            out = subprocess.run(["git", "diff", "--unified=3"], capture_output=True,
-                                 text=True, timeout=20)
+            out = subprocess.run(["git", "diff", "--unified=3", "--", ".",
+                                  ":(exclude)logs/**", ":(exclude)submissions/**",
+                                  ":(exclude)checkpoints/**"], capture_output=True,
+                                 text=True, encoding="utf-8", errors="replace", timeout=20)
             diff = out.stdout or ""
         except Exception as exc:
             return f"(diff unavailable: {exc})"
@@ -79,17 +81,49 @@ class RunLogger:
     @staticmethod
     def _infer_checkpoint(command: str) -> Optional[str]:
         toks = command.split()
-        model = loss = None
+        model, loss, propensity = None, None, "none"
+        auc_weight, cap = 0.5, 0
         for i, t in enumerate(toks):
             if t == "--model" and i + 1 < len(toks):
                 model = toks[i + 1]
             if t == "--loss" and i + 1 < len(toks):
                 loss = toks[i + 1]
+            if t == "--auc_weight" and i + 1 < len(toks):
+                auc_weight = float(toks[i + 1])
+            if t == "--propensity" and i + 1 < len(toks):
+                propensity = toks[i + 1]
+            if t == "--max_group_rows" and i + 1 < len(toks):
+                cap = int(toks[i + 1])
         if model is None:
             return None
-        if model in ("fm", "mmoe", "lgb"):
+        if model == "fm":
             return model
-        return f"{model}_{loss or 'listwise'}"
+        if model == "lgb":
+            for i, t in enumerate(toks):
+                if t == "--feature_recipe" and i + 1 < len(toks):
+                    try:
+                        from pipeline.feature_recipes import load_recipe
+                        return f"lgb_recipe_{load_recipe(toks[i + 1]).recipe_id}"
+                    except Exception:
+                        return None
+            profile = "affinity"
+            selected = "--select_features" in toks
+            for i, t in enumerate(toks):
+                if t == "--feature_profile" and i + 1 < len(toks):
+                    profile = toks[i + 1]
+            return f"lgb_{profile}{'_selected' if selected else ''}"
+        name = f"{model}_{loss or 'listwise'}"
+        if loss == "hybrid":
+            name += f"_aw{int(round(auc_weight * 100))}"
+        if propensity != "none":
+            clip = 10
+            for i, t in enumerate(toks):
+                if t == "--propensity_clip" and i + 1 < len(toks):
+                    clip = int(round(float(toks[i + 1])))
+            name += f"_{propensity}{clip}"
+        if cap:
+            name += f"_cap{cap}"
+        return name
 
     # -- writing -----------------------------------------------------------
 
@@ -113,6 +147,9 @@ class RunLogger:
             f.write(f"- Proposal source: `{entry.proposal_source}`\n")
             f.write(f"- Target file: `{entry.target_file}`\n")
             f.write(f"- Command: `{entry.command}`\n")
+            if entry.recipe_id:
+                f.write(f"- Feature recipe: `{entry.recipe_id}`\n\n")
+                f.write(f"```json\n{json.dumps(entry.feature_recipe, indent=2)}\n```\n\n")
             if entry.metrics:
                 m = entry.metrics
                 f.write(f"- **Validation**: GAUC {m.get('gauc', 0):.4f} | "

@@ -25,7 +25,8 @@ import numpy as np
 from pipeline.data import load_kuairand
 from pipeline.evaluate import evaluate
 from pipeline.features import (encode_features, extract_dense_tabular_features,
-                               extract_sequential_features)
+                               extract_sequential_features, select_rank_features)
+from pipeline.feature_recipes import FeatureRecipe
 
 HEADER = ['row_id', 'user_id', 'video_id', 'score']
 CHECKPOINTS_DIR = "checkpoints"
@@ -124,9 +125,17 @@ def predict_split(name: str, splits: Dict[str, List[dict]], split: str) -> np.nd
 
     if arch == 'lgb':
         import lightgbm as lgb
-        dense, _names = extract_dense_tabular_features(splits)
+        recipe_payload = meta.get('feature_recipe')
+        recipe = (FeatureRecipe.model_validate(recipe_payload) if recipe_payload else
+                  FeatureRecipe(base_profile=meta.get('feature_profile', 'affinity'),
+                                use_rank_selection=meta.get('select_features', False)))
+        dense, names = extract_dense_tabular_features(splits, recipe=recipe)
+        if meta.get('select_features', False):
+            dense, names = select_rank_features(
+                dense, names, min_within_user_variance=recipe.min_within_user_variance)
         X = dense[split][0]
-        booster = lgb.Booster(model_file=os.path.join(CHECKPOINTS_DIR, "lgb.txt"))
+        booster = lgb.Booster(model_file=os.path.join(
+            CHECKPOINTS_DIR, meta.get('artifact', 'lgb.txt')))
         return np.asarray(booster.predict(X), dtype=np.float64)
 
     enc, encoder = encode_features(splits, use_cwm_fields=meta.get("use_cwm", False))
@@ -140,12 +149,13 @@ def predict_split(name: str, splits: Dict[str, List[dict]], split: str) -> np.nd
         return np.asarray(m.predict(X), dtype=np.float64)
 
     import torch
-    from pipeline.models import DEVICE, DIN, DeepFM, MMoE, TorchFM
+    from pipeline.models import DEVICE, DIN, DeepFM, DenseDeepFM, MMoE, TorchFM
     from pipeline.train import _predict_torch
 
     dim = meta.get("embed_dim", 16)
     n_fields = len(encoder.field_names)
     hist = None
+    dense_x = None
 
     if arch == 'din':
         seqs = extract_sequential_features(splits, encoder,
@@ -160,6 +170,18 @@ def predict_split(name: str, splits: Dict[str, List[dict]], split: str) -> np.nd
                      num_tasks=1 + len(AUX_TASKS))
     elif arch == 'deepfm':
         model = DeepFM(encoder.total_dim, n_fields, embed_dim=dim)
+    elif arch == 'deepfm_dense':
+        recipe = FeatureRecipe.model_validate(meta['feature_recipe'])
+        dense, names = extract_dense_tabular_features(splits, recipe=recipe)
+        if recipe.use_rank_selection:
+            dense, names = select_rank_features(
+                dense, names, recipe.min_within_user_variance)
+        if names != meta['dense_feature_names']:
+            raise ValueError('dense feature schema differs from training checkpoint')
+        mean = np.asarray(meta['dense_mean'], dtype=np.float32)
+        std = np.asarray(meta['dense_std'], dtype=np.float32)
+        dense_x = np.nan_to_num((dense[split][0] - mean) / std, posinf=0., neginf=0.)
+        model = DenseDeepFM(encoder.total_dim, n_fields, len(names), embed_dim=dim)
     elif arch == 'fm_torch':
         model = TorchFM(encoder.total_dim, n_fields, embed_dim=dim)
     else:
@@ -167,7 +189,7 @@ def predict_split(name: str, splits: Dict[str, List[dict]], split: str) -> np.nd
 
     ckpt = os.path.join(CHECKPOINTS_DIR, f"{name}.pt")
     model.load_state_dict(torch.load(ckpt, map_location='cpu'))
-    return _predict_torch(model.to(DEVICE), X, hist)
+    return _predict_torch(model.to(DEVICE), X, hist, dense_x)
 
 
 def prediction_cache_path(name: str, split: str) -> str:
@@ -260,6 +282,8 @@ def main(argv=None):
     g.add_argument('--check', action='store_true')
     g.add_argument('--export', action='store_true',
                    help="cache valid+test predictions for one checkpoint (run once per model)")
+    p.add_argument('--split', choices=['valid', 'test'], default=None,
+                   help='with --export, cache only this split')
     a = p.parse_args(argv)
 
     if a.export:
@@ -267,7 +291,7 @@ def main(argv=None):
             p.error("--export needs --checkpoint")
         splits = load_kuairand(a.data_dir, include_test=True)
         for name in a.checkpoint:
-            for split in ('valid', 'test'):
+            for split in ((a.split,) if a.split else ('valid', 'test')):
                 export_predictions(name, splits, split)
     elif a.generate:
         if not a.checkpoint:

@@ -30,15 +30,17 @@ from sandbox.logger import RunLogger
 from sandbox.runner import ExecutionRunner
 
 PY = sys.executable
-CONFIG_DIR = "configs"
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CONFIG_DIR = os.path.join(PROJECT_ROOT, "configs")
 
 
-def load_dotenv_if_present(path: str = ".env"):
+def load_dotenv_if_present(path: Optional[str] = None):
     """Minimal .env reader — avoids a dependency for three lines of parsing."""
+    path = path or os.path.join(PROJECT_ROOT, ".env")
     if not os.path.exists(path):
         return
     try:
-        with open(path, encoding="utf-8") as fh:
+        with open(path, encoding="utf-8-sig") as fh:
             for line in fh:
                 line = line.strip()
                 if line and not line.startswith("#") and "=" in line:
@@ -69,6 +71,36 @@ def load_yaml(name: str) -> Dict[str, Any]:
 # behaviour sequence — leads.
 
 STRATEGY_BANK: List[Dict[str, str]] = [
+    {"stage": "Feature Engineering",
+     "hypothesis": "Fuse strictly causal affinity, completion-history, recency and momentum "
+                   "features into DeepFM so feature recipes affect a strong identity model "
+                   "instead of being isolated in a weaker tree-only ablation.",
+     "target_file": "pipeline/models.py",
+     "command": f"{PY} -m pipeline.train --model deepfm_dense --loss pointwise "
+                "--feature_profile full --select_features --epochs 12"},
+
+    {"stage": "Noise Reduction",
+     "hypothesis": "Reduce optimization variance without changing labels or deleting "
+                   "interactions: train a second seed of the validated causal DeepFM and "
+                   "let validation-only rank blending average uncorrelated errors.",
+     "target_file": "pipeline/train.py",
+     "command": f"{PY} -m pipeline.train --model deepfm_dense --loss pointwise "
+                "--feature_profile full --select_features --seed 1 --epochs 12"},
+    {"stage": "Loss Function",
+     "hypothesis": "Optimize both halves of the primary metric with a hybrid objective: "
+                   "BPR supplies GAUC-oriented pair ordering while delta-nDCG weights errors "
+                   "near rank 5. Preserve every power-user impression instead of capping groups.",
+     "target_file": "pipeline/models.py",
+     "command": f"{PY} -m pipeline.train --model fm_torch --loss hybrid "
+                "--auc_weight 0.5 --max_group_rows 0 --epochs 15"},
+
+    {"stage": "Causal Debiasing",
+     "hypothesis": "Use clipped self-normalized density ratios learned from KuaiRand's "
+                   "random-exposure log to reduce logging-policy bias while bounding variance.",
+     "target_file": "pipeline/propensity.py",
+     "command": f"{PY} -m pipeline.train --model fm_torch --loss hybrid "
+                "--auc_weight 0.5 --propensity snips --propensity_clip 10 --epochs 15"},
+
     {"stage": "Loss Function",
      "hypothesis": "Replace pointwise BCE with a within-user listwise softmax. The metrics "
                    "(GAUC, nDCG@5) rank inside a user's impression list, so a per-impression "
@@ -91,6 +123,22 @@ STRATEGY_BANK: List[Dict[str, str]] = [
                    "decorrelated errors.",
      "target_file": "pipeline/train.py",
      "command": f"{PY} -m pipeline.train --model lgb --objective lambdarank --trees 400"},
+
+    {"stage": "Feature Engineering",
+     "hypothesis": "Add strictly historical watch-completion, repeat-affinity and recency "
+                   "features. Candidate-row play time is forbidden because it leaks long_view; "
+                   "expanding-window aggregates preserve its useful history safely.",
+     "target_file": "pipeline/features.py",
+     "command": f"{PY} -m pipeline.train --model lgb --objective lambdarank "
+                "--feature_profile full --select_features --trees 400"},
+
+    {"stage": "Feature Engineering",
+     "hypothesis": "Ablate interaction crosses against core popularity and history features "
+                   "to measure whether user-video, user-author, duration and tab affinities "
+                   "add within-user ranking signal.",
+     "target_file": "pipeline/features.py",
+     "command": f"{PY} -m pipeline.train --model lgb --objective lambdarank "
+                "--feature_profile core --select_features --trees 400"},
 
     {"stage": "Sequential Modelling",
      "hypothesis": "Add target attention over the user's last 10 impressions (DIN). Nothing in "
@@ -142,6 +190,33 @@ STRATEGY_BANK: List[Dict[str, str]] = [
      "command": f"{PY} -m pipeline.train --model lgb --num_leaves 127 --lr 0.03 --trees 600"},
 ]
 
+# Put reliable controls before speculative objectives. The convergence rule can
+# stop after four trials, so ordering is part of the research design: previously
+# two weak experiments consumed half the useful horizon before the proven
+# listwise control ran, and the feature ranker was never reached.
+def _strategy_priority(strategy: Dict[str, str]) -> int:
+    cmd = strategy["command"]
+    if "--model fm_torch --loss listwise" in cmd and "--lr" not in cmd:
+        return 0
+    if "--model deepfm_dense" in cmd:
+        return 1 if "--seed 1" not in cmd else 2
+    if "--feature_profile full" in cmd:
+        return 5
+    if "--model mmoe --loss listwise --experts 4" in cmd:
+        return 2
+    if "--model deepfm" in cmd:
+        return 3
+    if "--model din" in cmd:
+        return 4
+    if "--loss hybrid" in cmd and "--propensity" not in cmd:
+        return 7
+    if "--propensity" in cmd:
+        return 99
+    return 10
+
+
+STRATEGY_BANK.sort(key=_strategy_priority)
+
 
 class RankAgentOrchestrator:
     def __init__(self, data_dir: Optional[str] = None,
@@ -173,17 +248,19 @@ class RankAgentOrchestrator:
         self.tree = TreeManager(epsilon=self.epsilon, n_convergence=self.patience,
                                 max_iterations=self.max_iterations)
         self.runner = ExecutionRunner(
-            timeout_seconds=int(sandbox_cfg.get("timeout_seconds_per_iteration", 1800)))
+            timeout_seconds=int(sandbox_cfg.get("timeout_seconds_per_iteration", 1800)),
+            cwd=PROJECT_ROOT)
         self.debugger = SelfHealingDebugger(
             max_retries=int(dbg_cfg.get("max_self_healing_attempts", 3)),
             llm_repair=self._llm_repair)
-        self.logger = RunLogger(run_id=run_id)
+        self.logger = RunLogger(log_dir=os.path.join(PROJECT_ROOT, "logs"), run_id=run_id)
 
         self.tokens = TokenUsage()
         self.manual_interventions = 0
         self.error_recoveries = 0
         self.failed_iterations = 0
         self._used_commands: set = set()
+        self._used_recipe_ids: set = set()
         self._client = None
 
     # -- data_dir threading ------------------------------------------------
@@ -235,12 +312,38 @@ class RankAgentOrchestrator:
         """
         for strat in STRATEGY_BANK:
             if strat["command"] not in self._used_commands:
+                if strat["stage"] == "Feature Engineering":
+                    from pipeline.feature_recipes import deterministic_recipes
+                    for recipe in deterministic_recipes():
+                        if recipe.recipe_id not in self._used_recipe_ids:
+                            path = self._save_recipe(recipe, iteration_id)
+                            command = (f"{PY} -m pipeline.train --model deepfm_dense "
+                                       f"--loss pointwise --feature_recipe {path} --epochs 12")
+                            return HypothesisProposal(
+                                source="fallback", stage="Feature Engineering",
+                                hypothesis=(f"Test recipe {recipe.name}: profile={recipe.base_profile}, "
+                                            f"item smoothing={recipe.item_smoothing}, cross smoothing="
+                                            f"{recipe.cross_smoothing}, exclusions={recipe.exclude_features}."),
+                                rationale="deterministic bounded recipe mutation",
+                                target_file="pipeline/features.py", command=command,
+                                feature_recipe=recipe.model_dump(), recipe_id=recipe.recipe_id)
                 return HypothesisProposal(source="fallback", rationale="deterministic plan",
                                           **strat)
         strat = STRATEGY_BANK[(iteration_id - 1) % len(STRATEGY_BANK)]
         return HypothesisProposal(source="fallback",
                                   rationale="plan exhausted; repeating with a new seed",
                                   **{**strat, "command": f"{strat['command']} --seed {iteration_id}"})
+
+    def _save_recipe(self, recipe, iteration_id: int) -> str:
+        from pipeline.feature_agent import FeatureEngineeringAgent
+        audit = FeatureEngineeringAgent().recipe_audit(recipe)
+        if audit['status'] != 'PASS':
+            raise ValueError(f"feature recipe failed audit: {audit}")
+        path = os.path.join("experiments", "recipes",
+                            f"iteration_{iteration_id:02d}_{recipe.recipe_id}.json")
+        recipe.save(path)
+        self._used_recipe_ids.add(recipe.recipe_id)
+        return path
 
     def _client_or_none(self):
         if self._client is not None:
@@ -280,7 +383,7 @@ class RankAgentOrchestrator:
             iteration_id=iteration_id,
             best_score=self.tree.best_primary_score,
             delta=self.tree.best_delta,
-            history_summary=self.tree.get_history_summary(),
+            history_summary=self.tree.get_history_summary() + self._feature_feedback_summary(),
         )
         try:
             kind, api = client
@@ -301,20 +404,56 @@ class RankAgentOrchestrator:
                 self.tokens.add(resp.usage.prompt_tokens, resp.usage.completion_tokens)
 
             data = json.loads(text[text.index("{"):text.rindex("}") + 1])
+            stage = str(data.get("stage", "Unspecified"))
             cmd = str(data["execution_command"]).strip()
             if "pipeline.train" not in cmd:
                 raise ValueError("command does not invoke pipeline.train")
             if cmd.startswith("python "):
                 cmd = f"{PY} " + cmd[len("python "):]
+            recipe_payload = data.get("feature_recipe")
+            recipe_id = None
+            if stage == "Feature Engineering" and recipe_payload is None:
+                raise ValueError("Feature Engineering proposal omitted feature_recipe")
+            if stage == "Feature Engineering":
+                from pipeline.feature_recipes import FeatureRecipe
+                recipe = FeatureRecipe.model_validate(recipe_payload)
+                if recipe.recipe_id in self._used_recipe_ids:
+                    raise ValueError(f"feature recipe {recipe.recipe_id} was already tested")
+                path = self._save_recipe(recipe, iteration_id)
+                # Compile every AI recipe into the fused identity + causal-feature
+                # ranker so the mutation can improve the strongest model family.
+                cmd = (f"{PY} -m pipeline.train --model deepfm_dense --loss pointwise "
+                       f"--feature_recipe {path} --epochs 12")
+                recipe_payload, recipe_id = recipe.model_dump(), recipe.recipe_id
             return HypothesisProposal(
-                stage=str(data.get("stage", "Unspecified")),
+                stage=stage,
                 hypothesis=str(data["hypothesis"]),
                 rationale=str(data.get("rationale", "")),
                 target_file=str(data.get("target_file", "pipeline/train.py")),
-                command=cmd, source="llm")
+                command=cmd, source="llm",
+                feature_recipe=recipe_payload if stage == "Feature Engineering" else None,
+                recipe_id=recipe_id)
         except Exception as exc:
             print(f"  [WARN] LLM proposal unusable ({exc}); using the deterministic plan.")
             return self._fallback_proposal(iteration_id)
+
+    def _feature_feedback_summary(self) -> str:
+        """Feed top feature gains and tested recipe IDs into the next AI turn."""
+        blocks = []
+        for checkpoint in dict.fromkeys(self.logger._checkpoints.values()):
+            path = os.path.join("checkpoints", f"{checkpoint}.importance.json")
+            if not os.path.exists(path):
+                continue
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    payload = json.load(fh)
+                top = payload.get("features", [])[:5]
+                rendered = ", ".join(
+                    f"{f['name']}={100*f['gain_fraction']:.1f}%" for f in top)
+                blocks.append(f"\n- Feature feedback {payload.get('recipe_id')}: {rendered}")
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+        return ("\n\nFeature-recipe feedback:" + "".join(blocks)) if blocks else ""
 
     def _llm_repair(self, command: str, traceback_text: str, kind: str) -> Optional[str]:
         """Repair callback handed to the debugger. Returns a corrected command."""
@@ -357,6 +496,8 @@ class RankAgentOrchestrator:
         proposal = self.propose(iteration_id)
         command = self._with_data_dir(proposal.command)
         self._used_commands.add(proposal.command)
+        if proposal.recipe_id:
+            self._used_recipe_ids.add(proposal.recipe_id)
 
         print(f"  Stage      : {proposal.stage}  [{proposal.source}]")
         print(f"  Hypothesis : {proposal.hypothesis}")
@@ -399,6 +540,7 @@ class RankAgentOrchestrator:
             stage=proposal.stage, hypothesis=proposal.hypothesis,
             rationale=proposal.rationale, target_file=proposal.target_file,
             command=command, proposal_source=proposal.source,
+            feature_recipe=proposal.feature_recipe, recipe_id=proposal.recipe_id,
             code_diff=self.logger.capture_diff(),
             status=status, metrics=metrics.model_dump() if metrics else None,
             delta_over_baseline=metrics.delta_from_baseline if metrics else None,
@@ -412,7 +554,7 @@ class RankAgentOrchestrator:
     # -- terminal state ----------------------------------------------------
 
     def build_submission(self) -> Optional[str]:
-        """Export the validation-best checkpoint. The only step that reads test rows."""
+        """Select a safe validation blend, diagnose it, then export hidden-test scores."""
         best_id = self.tree.best_node_id
         if best_id is None:
             print("[SUBMIT] no successful iteration; nothing to submit")
@@ -421,10 +563,55 @@ class RankAgentOrchestrator:
         if not name:
             print("[SUBMIT] could not identify the winning checkpoint; skipping export")
             return None
+        selected = [name]
+        weight = None
+
+        # Every trainer caches validation predictions in original row order.
+        # Search a two-model rank blend, but accept it only if official public
+        # validation improves. Weak feature models therefore cannot degrade the
+        # final submission; they may only contribute a small decorrelated signal.
+        best_cache = os.path.join("checkpoints", f"{name}.valid.npy")
+        if os.path.exists(best_cache):
+            try:
+                from pipeline.data import load_kuairand
+                from pipeline.submit import blend_weight_on_valid
+                splits = load_kuairand(self.data_dir)
+                blend_primary = self.tree.best_primary_score
+                for candidate in dict.fromkeys(self.logger._checkpoints.values()):
+                    if candidate == name:
+                        continue
+                    if not os.path.exists(os.path.join("checkpoints", f"{candidate}.valid.npy")):
+                        continue
+                    w, primary = blend_weight_on_valid([name, candidate], splits, grid=41)
+                    if primary > blend_primary + 1e-5:
+                        selected, weight, blend_primary = [name, candidate], w, primary
+                if len(selected) == 2:
+                    print(f"[ENSEMBLE] accepted {selected} at weight {weight:.3f}: "
+                          f"valid primary {blend_primary:.4f}")
+                    self.tree.best_primary_score = blend_primary
+            except Exception as exc:
+                print(f"[ENSEMBLE] skipped safely: {type(exc).__name__}: {exc}")
+
+        # Produce test predictions for selected components in isolated processes.
+        for checkpoint in selected:
+            export = f"{PY} -m pipeline.submit --export --checkpoint {checkpoint} --split test"
+            result = self.runner.run_command(self._with_data_dir(export), allow_no_metrics=True)
+            if result.status != "SUCCESS":
+                print(f"[SUBMIT FAILED] could not export {checkpoint}: "
+                      f"{(result.error_traceback or '')[-500:]}")
+                return None
+
+        # Diagnostics are automatic and validation-only. For a blend, each
+        # component remains inspectable and the blend score is printed above.
+        diag = f"{PY} -m pipeline.diagnostics --checkpoint {name}"
+        self.runner.run_command(self._with_data_dir(diag), allow_no_metrics=True)
+
         out = os.path.join("submissions", "kuairand_pure_final.csv")
-        print(f"\n[SUBMIT] exporting validation-best checkpoint {name!r} "
-              f"(iteration {best_id}, valid primary {self.tree.best_primary_score:.4f})")
-        cmd = (f"{PY} -m pipeline.submit --generate --checkpoint {name} --file {out}")
+        print(f"\n[SUBMIT] exporting validation-selected {selected} "
+              f"(valid primary {self.tree.best_primary_score:.4f})")
+        ckpts = " ".join(selected)
+        weight_arg = f" --weight {weight}" if weight is not None else ""
+        cmd = (f"{PY} -m pipeline.submit --generate --checkpoint {ckpts}{weight_arg} --file {out}")
         res = self.runner.run_command(self._with_data_dir(cmd))
         if res.status == "SUCCESS" or "VALIDATION PASS" in (res.stdout_summary or ""):
             return out
@@ -440,6 +627,29 @@ class RankAgentOrchestrator:
         print(f"budget: {self.max_iterations} iterations | {self.max_wall_clock/3600:.1f}h "
               f"| convergence eps={self.epsilon} N={self.patience}")
         print("=" * 74)
+
+        # Full real-data outcome-mutation audit, launched in isolation so the
+        # orchestrator remains small and `python main.py` is the only entrypoint.
+        audit_path = os.path.join("logs", "feature_audit.json")
+        audit_cmd = f"{PY} -m pipeline.feature_agent --dynamic --output {audit_path}"
+        audit_result = self.runner.run_command(self._with_data_dir(audit_cmd),
+                                               allow_no_metrics=True)
+        try:
+            with open(audit_path, encoding="utf-8") as fh:
+                feature_audit = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            feature_audit = {"status": "FAIL"}
+        print(f"[FEATURE AUDIT] {feature_audit['status']} -> {audit_path}")
+        if audit_result.status != "SUCCESS" or feature_audit['status'] != 'PASS':
+            print("[HALT] feature manifest/leakage governance failed")
+            self._write_summary(t0, "feature audit failed", None)
+            return
+
+        client = self._client_or_none()
+        if client is None:
+            print("[AI] no API key detected; using deterministic adaptive feature recipes")
+        else:
+            print(f"[AI] {client[0]} connected; validation and feature-importance feedback enabled")
 
         if self.run_baseline_flag:
             if not self.run_baseline():

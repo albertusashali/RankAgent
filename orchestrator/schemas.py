@@ -55,6 +55,8 @@ class HypothesisProposal(BaseModel):
     rationale: str = ""
     target_file: str = "pipeline/train.py"
     command: str
+    feature_recipe: Optional[Dict[str, Any]] = None
+    recipe_id: Optional[str] = None
     source: Literal["llm", "fallback", "repair"] = "llm"
 
 
@@ -68,6 +70,8 @@ class IterationLogEntry(BaseModel):
     target_file: str
     command: str
     proposal_source: str = "llm"
+    feature_recipe: Optional[Dict[str, Any]] = None
+    recipe_id: Optional[str] = None
     code_diff: str = ""
     status: Literal["ACCEPTED", "REJECTED", "ERROR_RECOVERED", "FAILED"]
     metrics: Optional[Dict[str, Any]] = None

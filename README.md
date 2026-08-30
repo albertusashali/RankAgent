@@ -8,6 +8,22 @@
 
 > **RankAgent** is an LLM-driven autonomous machine learning research agent engineered specifically for recommender system (RecSys) ranking problems. Given a tabular/interaction dataset and target metrics, RankAgent autonomously drives the closed-loop cycle of problem formulation, exploratory data analysis, feature engineering, architecture search & multi-task modeling, training/tuning, and rigorous offline evaluation with self-healing reflection.
 
+The metric-aligned feature engineering, hybrid GAUC/nDCG loss, randomized-exposure
+debiasing, feature governance, checkpoint naming, and diagnostic workflow are
+documented in [docs/INNOVATION_UPGRADE.md](docs/INNOVATION_UPGRADE.md).
+
+Run the complete workflow—feature audit, baseline, autonomous experiments,
+validation-selected ensembling, diagnostics, and submission—with one command:
+
+```bash
+python main.py
+```
+
+When an OpenAI or Anthropic key is present in `.env`, the research model can
+propose validated feature recipes on successive iterations and receives prior
+validation metrics plus feature importance as feedback. Without a key, the same
+command searches a deterministic bounded recipe set.
+
 ---
 
 ## 📌 Table of Contents

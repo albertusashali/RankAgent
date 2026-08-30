@@ -13,7 +13,7 @@ import pytest
 from pipeline.data import (SPLITS, WITHHELD, load_kuairand, load_test_labels)
 from pipeline.evaluate import evaluate
 from pipeline.features import (encode_features, extract_dense_tabular_features,
-                               extract_sequential_features)
+                               extract_sequential_features, select_rank_features)
 
 DATA_OK = True
 try:
@@ -139,6 +139,89 @@ def test_dense_features_have_no_pure_user_side_leftovers():
     _dense, names = extract_dense_tabular_features(_synthetic())
     for cross in ('user_author_affinity', 'user_durbucket_affinity', 'user_tab_affinity'):
         assert cross in names
+
+
+def test_full_features_are_strictly_historical():
+    splits = _synthetic()
+    before, names = extract_dense_tabular_features(splits, profile='full')
+    changed = {'train': [dict(r) for r in splits['train']], 'valid': splits['valid']}
+    changed['train'][4]['play_time_ms'] = 999999.0
+    after, _ = extract_dense_tabular_features(changed, profile='full')
+    assert np.array_equal(before['train'][0][4], after['train'][0][4])
+    assert 'video_completion_logratio' in names
+
+
+def test_rank_feature_selector_drops_user_constants():
+    X = np.asarray([[1, 1], [1, 2], [3, 4], [3, 5]], dtype=np.float32)
+    dense = {'train': (X, np.zeros(4), ['a', 'a', 'b', 'b']),
+             'valid': (X.copy(), np.zeros(4), ['a', 'a', 'b', 'b'])}
+    selected, names = select_rank_features(dense, ['user_constant', 'candidate_signal'])
+    assert names == ['candidate_signal']
+    assert selected['train'][0].shape == (4, 1)
+
+
+def test_feature_manifest_covers_every_dense_feature():
+    from pipeline.feature_agent import FeatureEngineeringAgent
+    report = FeatureEngineeringAgent().static_audit()
+    assert report['status'] == 'PASS'
+    assert report['missing_manifests'] == []
+
+
+def test_feature_recipe_hash_ignores_display_name_and_detects_behavior():
+    from pipeline.feature_recipes import FeatureRecipe
+    a = FeatureRecipe(name='first')
+    b = FeatureRecipe(name='renamed')
+    c = FeatureRecipe(name='first', cross_smoothing=9)
+    assert a.recipe_id == b.recipe_id
+    assert a.recipe_id != c.recipe_id
+
+
+def test_feature_recipe_rejects_unknown_features_at_compile_time():
+    from pipeline.feature_recipes import FeatureRecipe
+    recipe = FeatureRecipe(include_features=['not_a_real_feature'])
+    with pytest.raises(ValueError, match='unknown feature'):
+        extract_dense_tabular_features(_synthetic(), recipe=recipe)
+
+
+def test_grouped_batches_do_not_truncate_power_users_by_default():
+    from pipeline.train import _grouped_batches
+    groups = [np.arange(500), np.arange(500, 510)]
+    batches = list(_grouped_batches(groups, np.random.default_rng(0), target_rows=100))
+    seen = np.concatenate([b[0] for b in batches])
+    assert len(seen) == 510
+    assert len(np.unique(seen)) == 510
+
+
+def test_hybrid_loss_is_finite_and_differentiable():
+    torch = pytest.importorskip('torch')
+    from pipeline.models import hybrid_ranking_loss
+    logits = torch.tensor([0.2, -0.1, 0.7, 0.0, 0.4], requires_grad=True)
+    labels = torch.tensor([1., 0., 1., 0., 1.])
+    groups = torch.tensor([0, 0, 0, 1, 1])
+    loss = hybrid_ranking_loss(logits, labels, groups, 2, auc_weight=0.5, cutoff=5)
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert logits.grad is not None and torch.isfinite(logits.grad).all()
+
+
+def test_dense_deepfm_fuses_categorical_and_causal_features():
+    torch = pytest.importorskip('torch')
+    from pipeline.models import DenseDeepFM
+    model = DenseDeepFM(num_features=20, num_fields=3, num_dense=5, embed_dim=4)
+    cat = torch.tensor([[1, 2, 3], [4, 5, 6]])
+    dense = torch.randn(2, 5)
+    scores = model(cat, dense)
+    assert scores.shape == (2,)
+    scores.sum().backward()
+    assert any(p.grad is not None for p in model.dense_tower.parameters())
+
+
+def test_noise_reduction_cli_bounds_label_smoothing():
+    from pipeline.train import build_parser
+    args = build_parser().parse_args(['--label_smoothing', '0.03',
+                                      '--recency_half_life', '14'])
+    assert args.label_smoothing == pytest.approx(0.03)
+    assert args.recency_half_life == pytest.approx(14.0)
 
 
 # --- convergence -----------------------------------------------------------

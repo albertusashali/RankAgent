@@ -22,7 +22,8 @@ class ExecutionRunner:
         self.python_executable = python_executable or sys.executable
         self.cwd = cwd or os.getcwd()
 
-    def run_command(self, cmd: str, env_vars: Optional[Dict[str, str]] = None) -> ExecutionResult:
+    def run_command(self, cmd: str, env_vars: Optional[Dict[str, str]] = None,
+                    allow_no_metrics: bool = False) -> ExecutionResult:
         env = os.environ.copy()
         env['PYTHONPATH'] = os.path.abspath(self.cwd)
         env['PYTHONUNBUFFERED'] = '1'
@@ -55,6 +56,9 @@ class ExecutionRunner:
 
             metrics = parse_execution_output(stdout)
             if metrics is None:
+                if allow_no_metrics:
+                    return ExecutionResult(status="SUCCESS", stdout_summary=(stdout or "")[-2000:],
+                                           wall_clock_seconds=elapsed, command_executed=cmd)
                 return ExecutionResult(
                     status="NO_METRICS",
                     error_traceback="Trial exited 0 but printed no [EVAL] line; "
