@@ -1,0 +1,489 @@
+{
+  "run_id": "rankagent-20260830-132742",
+  "benchmark": "KuaiRand-Pure",
+  "baseline_valid_primary": 0.6016,
+  "baseline_reproduced": true,
+  "best_valid_primary": 0.6038,
+  "best_delta": 0.0021999999999999797,
+  "best_iteration": 2,
+  "iterations_used": 5,
+  "iteration_cap": 5,
+  "halt_reason": "reached the 5-iteration cap",
+  "wall_clock_seconds": 1646.2876098155975,
+  "total_prompt_tokens": 6658,
+  "total_completion_tokens": 2116,
+  "llm_calls": 7,
+  "manual_interventions": 0,
+  "error_recoveries": 0,
+  "failed_iterations": 1,
+  "submission_path": "submissions/kuairand_pure_final.csv",
+  "cost_by_agent": {
+    "product_manager": {
+      "prompt": 1336,
+      "completion": 299,
+      "calls": 2
+    },
+    "researcher": {
+      "prompt": 5322,
+      "completion": 1817,
+      "calls": 5
+    }
+  },
+  "iterations": [
+    {
+      "iteration_id": 0,
+      "parent_node_id": null,
+      "node_id": 0,
+      "stage": "Baseline Reproduction",
+      "hypothesis": "Reproduce the organizer's FM baseline end to end",
+      "rationale": "Every later delta is measured against this run.",
+      "target_file": "pipeline/train.py",
+      "command": "/Users/pk/Documents/GitHub/RankAgent/.venv/bin/python -m pipeline.train --model fm --data_dir data/KuaiRand-Pure/data",
+      "proposal_source": "fallback",
+      "code_diff": "",
+      "status": "ACCEPTED",
+      "metrics": {
+        "gauc": 0.6671,
+        "ndcg_5": 0.5358,
+        "primary_score": 0.6015,
+        "delta_from_baseline": -9.999999999998899e-05,
+        "raw_stdout": "==> loading KuaiRand-Pure (train + valid; hidden test is sealed)\n{'train': 1141112, 'valid': 124909}\n  epoch  1 | loss 0.6391 | valid GAUC 0.6467 nDCG@5 0.5272 primary 0.5869 | 1.2s\n  epoch  2 | loss 0.5479 | valid GAUC 0.6589 nDCG@5 0.5323 primary 0.5956 | 1.2s\n  epoch  3 | loss 0.5129 | valid GAUC 0.6642 nDCG@5 0.5344 primary 0.5993 | 1.2s\n  epoch  4 | loss 0.5004 | valid GAUC 0.6642 nDCG@5 0.5346 primary 0.5994 | 1.2s\n  epoch  5 | loss 0.4941 | valid GAUC 0.6661 nDCG@5 0.5360 primary 0.6010 | 1.2s\n  epoch  6 | loss 0.4897 | valid GAUC 0.6658 nDCG@5 0.5354 primary 0.6006 | 1.4s\n  epoch  7 | loss 0.4859 | valid GAUC 0.6671 nDCG@5 0.5358 primary 0.6015 | 1.2s\n  epoch  8 | loss 0.4821 | valid GAUC 0.6665 nDCG@5 0.5359 primary 0.6012 | 1.2s\n  epoch  9 | loss 0.4784 | valid GAUC 0.6666 nDCG@5 0.5348 primary 0.6007 | 1.2s\n  epoch 10 | loss 0.4744 | valid GAUC 0.6650 nDCG@5 0.5342 primary 0.5996 | 1.2s\n  epoch 11 | loss 0.4705 | valid GAUC 0.6640 nDCG@5 0.5341 primary 0.5990 | 1.2s\n  early stop at epoch 11\n[EVAL] GAUC: 0.6671 | nDCG@5: 0.5358 | Primary: 0.6015\n"
+      },
+      "delta_over_baseline": -9.999999999998899e-05,
+      "error_recovery": null,
+      "agent_trace": null,
+      "prompt_tokens": 0,
+      "completion_tokens": 0,
+      "llm_calls": 0,
+      "cumulative_prompt_tokens": 0,
+      "cumulative_completion_tokens": 0,
+      "wall_clock_seconds": 598.7628610134125,
+      "manual_interventions": 0
+    },
+    {
+      "iteration_id": 1,
+      "parent_node_id": 0,
+      "node_id": 1,
+      "stage": "architecture",
+      "hypothesis": "Test the DIN model architecture with listwise loss.",
+      "rationale": "DIN (Deep Interest Network) is designed to capture user interests by focusing on the most relevant parts of the user's history. Using listwise loss can enhance this by optimizing the entire ranking list, potentially improving the within-user ranking by better capturing the user's preferences.",
+      "target_file": "pipeline/train.py",
+      "command": "/Users/pk/Documents/GitHub/RankAgent/.venv/bin/python -m pipeline.train --model din --loss listwise --embed_dim 32 --lr 0.001 --epochs 12 --batch_size 8192 --data_dir data/KuaiRand-Pure/data",
+      "proposal_source": "llm",
+      "code_diff": "diff --git a/kuairand-starter-kit/__pycache__/evaluate.cpython-314.pyc b/kuairand-starter-kit/__pycache__/evaluate.cpython-314.pyc\nindex d18da56..48a84ea 100644\nBinary files a/kuairand-starter-kit/__pycache__/evaluate.cpython-314.pyc and b/kuairand-starter-kit/__pycache__/evaluate.cpython-314.pyc differ\ndiff --git a/main.py b/main.py\nindex 9fc5392..3109b60 100644\n--- a/main.py\n+++ b/main.py\n@@ -10,18 +10,29 @@ def main():\n     parser.add_argument(\"--data_dir\", default=None, help=\"Path to KuaiRand-Pure dataset directory (optional, auto-detected)\")\n     parser.add_argument(\"--max_iterations\", type=int, default=None, help=\"Iteration budget (default: configs/benchmark_kuairand.yaml, hard cap 50)\")\n     parser.add_argument(\"--max_wall_clock\", type=int, default=None, help=\"Wall-clock ceiling in seconds (default: configs/benchmark_kuairand.yaml, 6h)\")\n-    parser.add_argument(\"--run_baseline\", action=\"store_true\", help=\"Explicitly re-train the Factorization Machine baseline before starting iterations\")\n+    # Baseline reproduction is ON by default: the challenge requires confirming\n+    # the official validation score before iterating, and the run log is the\n+    # evidence for it. --skip-baseline exists only for fast development loops and\n+    # marks the run as unverified in the log.\n+    parser.add_argument(\"--skip-baseline\", action=\"store_true\",\n+                        help=\"Development shortcut: seed from the published 0.6016 instead of \"\n+                             \"reproducing it (~90s). The run is then marked unverified; \"\n+                             \"do not use it for a submitted run.\")\n     args = parser.parse_args()\n \n     print(\"==================================================================\")\n     print(\"         RankAgent: Autonomous RecSys ML Research Agent           \")\n     print(\"==================================================================\")\n+    if args.skip_baseline:\n+        print(\"  WARNING: --skip-baseline set. The baseline will be asserted, not\")\n+        print(\"           reproduced, and every delta will be relative to an\")\n+        print(\"           unverified reference. Not valid for a submitted run.\")\n     \n     agent = RankAgentOrchestrator(\n         data_dir=args.data_dir,\n         max_iterations=args.max_iterations,\n         max_wall_clock=args.max_wall_clock,\n-        run_baseline=args.run_baseline\n+        run_baseline=not args.skip_baseline,\n     )\n     agent.start_loop()\n \ndiff --git a/orchestrator/schemas.py b/orchestrator/schemas.py\nindex 2abf3a3..400a6fa 100644\n--- a/orchestrator/schemas.py\n+++ b/orchestrator/schemas.py\n@@ -73,17 +73,35 @@ class IterationLogEntry(BaseModel):\n     metrics: Optional[Dict[str, Any]] = None\n     delta_over_baseline: Optional[float] = None\n     error_recovery: Optional[Dict[str, Any]] = None\n+    #: How the four agent roles arrived at this iteration's experiment: the PM's\n+    #: directive, the hypotheses considered, what the Engineer rejected and why,\n+    #: and QA's pre-flight. This is the audit trail for the multi-agent design.\n+    agent_trace: Optional[Dict[str, Any]] = None\n+    #: Spent by THIS iteration (hypothesis call plus any repair calls it made).\n     prompt_tokens: int = 0\n     completion_tokens: int = 0\n+    llm_calls: int = 0\n+    #: Running totals as of the end of this iteration, so the log reads both ways\n+    #: without a reader having to sum the column.\n+    cumulative_prompt_tokens: int = 0\n+    cumulative_completion_tokens: int = 0\n     wall_clock_seconds: float = 0.0\n     manual_interventions: int = 0\n \n+    @property\n+    def iteration_tokens(self) -> int:\n+        return self.prompt_tokens + self.completion_tokens\n+\n \n class RunSummary(BaseModel):\n     \"\"\"Everything the Feasibility and Autonomy criteria are scored on.\"\"\"\n     run_id: str\n     benchmark: str = \"KuaiRand-Pure\"\n     baseline_valid_primary: float = 0.6016\n+    #: True only if this run re-ran and verified the baseline. False means the\n+    #: reference was asserted from the published value, so every delta below is\n+    #: relative to an unverified number.\n+    baseline_reproduced: bool = False\n     best_valid_primary: Optional[float] = None\n     best_delta: Optional[float] = None\n     best_iteration: Optional[int] = None\n@@ -98,6 +116,9 @@ class RunSummary(BaseModel):\n     error_recoveries: int = 0\n     failed_iterations: int = 0\n     submission_path: Optional[str] = None\n+    #: Token spend attributed per agent role, so the cost of the multi-agent\n+    #: design is visible rather than buried in a single total.\n+    cost_by_agent: Dict[str, Dict[str, int]] = Field(default_factory=dict)\n     iterations: List[Dict[str, Any]] = Field(default_factory=list)\n \n     @property\ndiff --git a/orchestrator/state_machine.py b/orchestrator/state_machine.py\nindex 7e91ff5..35f12dc 100644\n--- a/orchestrator/state_machine.py\n+++ b/orchestrator/state_machine.py\n@@ -22,6 +22,8 @@ from typing import Any, Dict, List, Optional, Tuple\n \n import yaml\n \n+from agents.context import ResearchContext\n+from agents.team import AgentTeam\n from orchestrator.schemas import (ExecutionResult, HypothesisProposal,\n                                   IterationLogEntry, RunSummary, TokenUsage)\n from orchestrator.tree_manager import BASELINE_VAL_PRIMARY, TreeManager\n@@ -147,7 +149,7 @@ class RankAgentOrchestrator:\n     def __init__(self, data_dir: Optional[str] = None,\n                  max_iterations: Optional[int] = None,\n                  max_wall_clock: Optional[int] = None, run_id: Optional[str] = None,\n-                 run_baseline: bool = False):\n+                 run_baseline: bool = True):\n         load_dotenv_if_present()\n         agent_cfg = load_yaml(\"agent_config.yaml\")\n         bench_cfg = load_yaml(\"benchmark_kuairand.yaml\")\n@@ -155,6 +157,8 @@ class RankAgentOrchestrator:\n \n         self.data_dir = data_dir\n         self.run_baseline_flag = run_baseline\n+        #: Whether this run actually re-ran the baseline, or merely asserted it.\n+        self.baseline_reproduced = False\n         # Explicit arguments win over the YAML defaults; YAML wins over the\n         # hard-coded fallback. The previous order let the config silently\n         # override a budget the operator had asked for on the command line.\n@@ -180,6 +184,13 @@ class RankAgentOrchestrator:\n         self.logger = RunLogger(run_id=run_id)\n \n         self.tokens = TokenUsage()\n+        self.team = AgentTeam(self.tokens, data_dir=data_dir,\n+                              pm_refresh=int(agent_cfg.get(\"agent\", {}).get(\"pm_refresh\", 3)),\n+                              proposals=int(agent_cfg.get(\"agent\", {}).get(\"proposals_per_call\", 3)),\n+                              max_retries=int(dbg_cfg.get(\"max_self_healing_attempts\", 3)))\n+        self.ctx = ResearchContext(baseline=BASELINE_VAL_PRIMARY,\n+                                   max_iterations=self.max_iterations,\n+                                   wall_clock_budget_s=float(self.max_wall_clock))\n         self.manual_interventions = 0\n         self.error_recoveries = 0\n         self.failed_iterations = 0\n@@ -210,6 +221,8 @@ class RankAgentOrchestrator:\n                   f\"drift {drift:+.4f})\")\n             if drift > 0.005:\n                 print(f\"[WARN] baseline drift exceeds 0.005 \u2014 investigate before trusting deltas\")\n+            self.baseline_reproduced = True\n+            self.ctx.baseline = m.primary_score\n             self.tree.record_baseline(m.primary_score, node_id=0)\n             self.logger.log_iteration(IterationLogEntry(\n                 iteration_id=0, node_id=0, parent_node_id=None,\n@@ -354,12 +367,45 @@ class RankAgentOrchestrator:\n     def run_iteration(self, iteration_id: int) -> bool:\n         \"\"\"Execute one hypothesis. Returns whether the run should halt.\"\"\"\n         print(f\"\\n{'=' * 74}\\n>>> ITERATION {iteration_id}/{self.max_iterations}\\n{'=' * 74}\")\n-        proposal = self.propose(iteration_id)\n-        command = self._with_data_dir(proposal.command)\n-        self._used_commands.add(p\n\u2026 truncated \u2026",
+      "status": "REJECTED",
+      "metrics": {
+        "gauc": 0.6623,
+        "ndcg_5": 0.5332,
+        "primary_score": 0.5978,
+        "delta_from_baseline": -0.0038000000000000256,
+        "raw_stdout": "==> loading KuaiRand-Pure (train + valid; hidden test is sealed)\n{'train': 1141112, 'valid': 124909}\n==> din | loss=listwise | dim=32 | fields=5 | cpu\n  epoch  1 | loss 3.6396 | valid GAUC 0.6623 nDCG@5 0.5332 primary 0.5978 | 3.9s\n  epoch  2 | loss 3.6034 | valid GAUC 0.6476 nDCG@5 0.5279 primary 0.5878 | 3.6s\n  epoch  3 | loss 3.5623 | valid GAUC 0.6311 nDCG@5 0.5196 primary 0.5753 | 3.6s\n  epoch  4 | loss 3.5086 | valid GAUC 0.6238 nDCG@5 0.5167 primary 0.5702 | 3.6s\n  early stop at epoch 4\n[EVAL] GAUC: 0.6623 | nDCG@5: 0.5332 | Primary: 0.5978\n"
+      },
+      "delta_over_baseline": -0.0038000000000000256,
+      "error_recovery": null,
+      "agent_trace": {
+        "directive": {
+          "phase": "initial exploration",
+          "focus_dimensions": [
+            "loss",
+            "architecture"
+          ],
+          "avoid_dimensions": [
+            "multi_task",
+            "sequence",
+            "features",
+            "capacity",
+            "optimisation"
+          ],
+          "reasoning": "Since no experiments have been conducted yet, it's crucial to explore dimensions that have never been tried to maximize coverage. Starting with 'loss' and 'architecture' will allow us to explore fundamental changes in model behavior and structure, which could lead to significant improvements. These dimensions are foundational and can provide insights into the potential of the model's core components. Avoiding dimensions that have shown dead ends or are less likely to yield immediate gains ensures efficient use of the budget.",
+          "valid_for": 3
+        },
+        "hypotheses_considered": [
+          {
+            "dimension": "architecture",
+            "hypothesis": "Test the DIN model architecture with listwise loss.",
+            "mechanism": "DIN (Deep Interest Network) is designed to capture user interests by focusing on the most relevant parts of the user's history. Using listwise loss can enhance this by optimizing the entire ranking list, potentially improving the within-user ranking by better capturing the user's preferences.",
+            "args": "--model din --loss listwise --embed_dim 32 --lr 0.001 --epochs 12 --batch_size 8192"
+          },
+          {
+            "dimension": "loss",
+            "hypothesis": "Test the DeepFM model with BPR loss.",
+            "mechanism": "DeepFM combines the strengths of factorization machines for capturing low-order feature interactions and deep neural networks for high-order interactions. BPR (Bayesian Personalized Ranking) loss is designed for ranking tasks and could improve the model's ability to differentiate between relevant and irrelevant impressions within a user.",
+            "args": "--model deepfm --loss bpr --embed_dim 32 --lr 0.001 --epochs 12 --batch_size 8192"
+          },
+          {
+            "dimension": "architecture",
+            "hypothesis": "Test the MMOE model architecture with pointwise loss.",
+            "mechanism": "MMOE (Multi-gate Mixture-of-Experts) can model complex user interactions by leveraging multiple experts. Using pointwise loss can help in learning individual impression relevance, which might improve the model's ability to rank impressions within a user by focusing on each impression's contribution.",
+            "args": "--model mmoe --loss pointwise --experts 6 --expert_dim 96 --lr 0.0005 --epochs 15 --batch_size 8192"
+          }
+        ],
+        "chosen": {
+          "dimension": "architecture",
+          "hypothesis": "Test the DIN model architecture with listwise loss.",
+          "mechanism": "DIN (Deep Interest Network) is designed to capture user interests by focusing on the most relevant parts of the user's history. Using listwise loss can enhance this by optimizing the entire ranking list, potentially improving the within-user ranking by better capturing the user's preferences.",
+          "args": "--model din --loss listwise --embed_dim 32 --lr 0.001 --epochs 12 --batch_size 8192",
+          "command": "/Users/pk/Documents/GitHub/RankAgent/.venv/bin/python -m pipeline.train --model din --loss listwise --embed_dim 32 --lr 0.001 --epochs 12 --batch_size 8192 --data_dir data/KuaiRand-Pure/data",
+          "checkpoint": "din_listwise",
+          "source": "llm",
+          "rejected": []
+        },
+        "rejected_by_engineer": [],
+        "preflight_problems": [],
+        "pm_refreshed": true,
+        "trace": [
+          "PM set phase 'initial exploration'",
+          "Researcher proposed 3",
+          "QA pre-flight passed"
+        ],
+        "qa_verdict": {
+          "trustworthy": true,
+          "note": ""
+        }
+      },
+      "prompt_tokens": 1469,
+      "completion_tokens": 530,
+      "llm_calls": 2,
+      "cumulative_prompt_tokens": 1469,
+      "cumulative_completion_tokens": 530,
+      "wall_clock_seconds": 23.724056720733643,
+      "manual_interventions": 0
+    },
+    {
+      "iteration_id": 2,
+      "parent_node_id": 0,
+      "node_id": 2,
+      "stage": "architecture",
+      "hypothesis": "Testing the MMoE model with pointwise loss",
+      "rationale": "The MMoE (Multi-gate Mixture of Experts) architecture can potentially capture complex user-item interactions by leveraging multiple expert networks, which might better model the diverse preferences within a user's impressions. Using pointwise loss can help the model focus on individual impression relevance, which is crucial for within-user ranking.",
+      "target_file": "pipeline/train.py",
+      "command": "/Users/pk/Documents/GitHub/RankAgent/.venv/bin/python -m pipeline.train --model=mmoe --loss=pointwise --embed_dim=32 --experts=4 --expert_dim=64 --lr=0.001 --epochs=12 --batch_size=8192 --data_dir data/KuaiRand-Pure/data",
+      "proposal_source": "llm",
+      "code_diff": "diff --git a/kuairand-starter-kit/__pycache__/evaluate.cpython-314.pyc b/kuairand-starter-kit/__pycache__/evaluate.cpython-314.pyc\nindex d18da56..48a84ea 100644\nBinary files a/kuairand-starter-kit/__pycache__/evaluate.cpython-314.pyc and b/kuairand-starter-kit/__pycache__/evaluate.cpython-314.pyc differ\ndiff --git a/main.py b/main.py\nindex 9fc5392..3109b60 100644\n--- a/main.py\n+++ b/main.py\n@@ -10,18 +10,29 @@ def main():\n     parser.add_argument(\"--data_dir\", default=None, help=\"Path to KuaiRand-Pure dataset directory (optional, auto-detected)\")\n     parser.add_argument(\"--max_iterations\", type=int, default=None, help=\"Iteration budget (default: configs/benchmark_kuairand.yaml, hard cap 50)\")\n     parser.add_argument(\"--max_wall_clock\", type=int, default=None, help=\"Wall-clock ceiling in seconds (default: configs/benchmark_kuairand.yaml, 6h)\")\n-    parser.add_argument(\"--run_baseline\", action=\"store_true\", help=\"Explicitly re-train the Factorization Machine baseline before starting iterations\")\n+    # Baseline reproduction is ON by default: the challenge requires confirming\n+    # the official validation score before iterating, and the run log is the\n+    # evidence for it. --skip-baseline exists only for fast development loops and\n+    # marks the run as unverified in the log.\n+    parser.add_argument(\"--skip-baseline\", action=\"store_true\",\n+                        help=\"Development shortcut: seed from the published 0.6016 instead of \"\n+                             \"reproducing it (~90s). The run is then marked unverified; \"\n+                             \"do not use it for a submitted run.\")\n     args = parser.parse_args()\n \n     print(\"==================================================================\")\n     print(\"         RankAgent: Autonomous RecSys ML Research Agent           \")\n     print(\"==================================================================\")\n+    if args.skip_baseline:\n+        print(\"  WARNING: --skip-baseline set. The baseline will be asserted, not\")\n+        print(\"           reproduced, and every delta will be relative to an\")\n+        print(\"           unverified reference. Not valid for a submitted run.\")\n     \n     agent = RankAgentOrchestrator(\n         data_dir=args.data_dir,\n         max_iterations=args.max_iterations,\n         max_wall_clock=args.max_wall_clock,\n-        run_baseline=args.run_baseline\n+        run_baseline=not args.skip_baseline,\n     )\n     agent.start_loop()\n \ndiff --git a/orchestrator/schemas.py b/orchestrator/schemas.py\nindex 2abf3a3..400a6fa 100644\n--- a/orchestrator/schemas.py\n+++ b/orchestrator/schemas.py\n@@ -73,17 +73,35 @@ class IterationLogEntry(BaseModel):\n     metrics: Optional[Dict[str, Any]] = None\n     delta_over_baseline: Optional[float] = None\n     error_recovery: Optional[Dict[str, Any]] = None\n+    #: How the four agent roles arrived at this iteration's experiment: the PM's\n+    #: directive, the hypotheses considered, what the Engineer rejected and why,\n+    #: and QA's pre-flight. This is the audit trail for the multi-agent design.\n+    agent_trace: Optional[Dict[str, Any]] = None\n+    #: Spent by THIS iteration (hypothesis call plus any repair calls it made).\n     prompt_tokens: int = 0\n     completion_tokens: int = 0\n+    llm_calls: int = 0\n+    #: Running totals as of the end of this iteration, so the log reads both ways\n+    #: without a reader having to sum the column.\n+    cumulative_prompt_tokens: int = 0\n+    cumulative_completion_tokens: int = 0\n     wall_clock_seconds: float = 0.0\n     manual_interventions: int = 0\n \n+    @property\n+    def iteration_tokens(self) -> int:\n+        return self.prompt_tokens + self.completion_tokens\n+\n \n class RunSummary(BaseModel):\n     \"\"\"Everything the Feasibility and Autonomy criteria are scored on.\"\"\"\n     run_id: str\n     benchmark: str = \"KuaiRand-Pure\"\n     baseline_valid_primary: float = 0.6016\n+    #: True only if this run re-ran and verified the baseline. False means the\n+    #: reference was asserted from the published value, so every delta below is\n+    #: relative to an unverified number.\n+    baseline_reproduced: bool = False\n     best_valid_primary: Optional[float] = None\n     best_delta: Optional[float] = None\n     best_iteration: Optional[int] = None\n@@ -98,6 +116,9 @@ class RunSummary(BaseModel):\n     error_recoveries: int = 0\n     failed_iterations: int = 0\n     submission_path: Optional[str] = None\n+    #: Token spend attributed per agent role, so the cost of the multi-agent\n+    #: design is visible rather than buried in a single total.\n+    cost_by_agent: Dict[str, Dict[str, int]] = Field(default_factory=dict)\n     iterations: List[Dict[str, Any]] = Field(default_factory=list)\n \n     @property\ndiff --git a/orchestrator/state_machine.py b/orchestrator/state_machine.py\nindex 7e91ff5..35f12dc 100644\n--- a/orchestrator/state_machine.py\n+++ b/orchestrator/state_machine.py\n@@ -22,6 +22,8 @@ from typing import Any, Dict, List, Optional, Tuple\n \n import yaml\n \n+from agents.context import ResearchContext\n+from agents.team import AgentTeam\n from orchestrator.schemas import (ExecutionResult, HypothesisProposal,\n                                   IterationLogEntry, RunSummary, TokenUsage)\n from orchestrator.tree_manager import BASELINE_VAL_PRIMARY, TreeManager\n@@ -147,7 +149,7 @@ class RankAgentOrchestrator:\n     def __init__(self, data_dir: Optional[str] = None,\n                  max_iterations: Optional[int] = None,\n                  max_wall_clock: Optional[int] = None, run_id: Optional[str] = None,\n-                 run_baseline: bool = False):\n+                 run_baseline: bool = True):\n         load_dotenv_if_present()\n         agent_cfg = load_yaml(\"agent_config.yaml\")\n         bench_cfg = load_yaml(\"benchmark_kuairand.yaml\")\n@@ -155,6 +157,8 @@ class RankAgentOrchestrator:\n \n         self.data_dir = data_dir\n         self.run_baseline_flag = run_baseline\n+        #: Whether this run actually re-ran the baseline, or merely asserted it.\n+        self.baseline_reproduced = False\n         # Explicit arguments win over the YAML defaults; YAML wins over the\n         # hard-coded fallback. The previous order let the config silently\n         # override a budget the operator had asked for on the command line.\n@@ -180,6 +184,13 @@ class RankAgentOrchestrator:\n         self.logger = RunLogger(run_id=run_id)\n \n         self.tokens = TokenUsage()\n+        self.team = AgentTeam(self.tokens, data_dir=data_dir,\n+                              pm_refresh=int(agent_cfg.get(\"agent\", {}).get(\"pm_refresh\", 3)),\n+                              proposals=int(agent_cfg.get(\"agent\", {}).get(\"proposals_per_call\", 3)),\n+                              max_retries=int(dbg_cfg.get(\"max_self_healing_attempts\", 3)))\n+        self.ctx = ResearchContext(baseline=BASELINE_VAL_PRIMARY,\n+                                   max_iterations=self.max_iterations,\n+                                   wall_clock_budget_s=float(self.max_wall_clock))\n         self.manual_interventions = 0\n         self.error_recoveries = 0\n         self.failed_iterations = 0\n@@ -210,6 +221,8 @@ class RankAgentOrchestrator:\n                   f\"drift {drift:+.4f})\")\n             if drift > 0.005:\n                 print(f\"[WARN] baseline drift exceeds 0.005 \u2014 investigate before trusting deltas\")\n+            self.baseline_reproduced = True\n+            self.ctx.baseline = m.primary_score\n             self.tree.record_baseline(m.primary_score, node_id=0)\n             self.logger.log_iteration(IterationLogEntry(\n                 iteration_id=0, node_id=0, parent_node_id=None,\n@@ -354,12 +367,45 @@ class RankAgentOrchestrator:\n     def run_iteration(self, iteration_id: int) -> bool:\n         \"\"\"Execute one hypothesis. Returns whether the run should halt.\"\"\"\n         print(f\"\\n{'=' * 74}\\n>>> ITERATION {iteration_id}/{self.max_iterations}\\n{'=' * 74}\")\n-        proposal = self.propose(iteration_id)\n-        command = self._with_data_dir(proposal.command)\n-        self._used_commands.add(p\n\u2026 truncated \u2026",
+      "status": "ACCEPTED",
+      "metrics": {
+        "gauc": 0.6706,
+        "ndcg_5": 0.5369,
+        "primary_score": 0.6038,
+        "delta_from_baseline": 0.0021999999999999797,
+        "raw_stdout": "==> loading KuaiRand-Pure (train + valid; hidden test is sealed)\n{'train': 1141112, 'valid': 124909}\n==> mmoe | loss=pointwise | experts=4 | dim=32 | cpu\n  epoch  1 | loss 0.9099 | valid GAUC 0.6573 nDCG@5 0.5315 primary 0.5944 | 3.3s\n  epoch  2 | loss 0.7053 | valid GAUC 0.6668 nDCG@5 0.5353 primary 0.6010 | 3.1s\n  epoch  3 | loss 0.6906 | valid GAUC 0.6692 nDCG@5 0.5366 primary 0.6029 | 3.1s\n  epoch  4 | loss 0.6830 | valid GAUC 0.6702 nDCG@5 0.5367 primary 0.6035 | 3.1s\n  epoch  5 | loss 0.6792 | valid GAUC 0.6705 nDCG@5 0.5369 primary 0.6037 | 3.1s\n  epoch  6 | loss 0.6767 | valid GAUC 0.6698 nDCG@5 0.5363 primary 0.6031 | 3.1s\n  epoch  7 | loss 0.6742 | valid GAUC 0.6706 nDCG@5 0.5369 primary 0.6038 | 3.1s\n  epoch  8 | loss 0.6710 | valid GAUC 0.6692 nDCG@5 0.5357 primary 0.6024 | 3.1s\n  epoch  9 | loss 0.6672 | valid GAUC 0.6670 nDCG@5 0.5344 primary 0.6007 | 3.1s\n  epoch 10 | loss 0.6630 | valid GAUC 0.6653 nDCG@5 0.5337 primary 0.5995 | 3.1s\n  early stop at epoch 10\n[EVAL] GAUC: 0.6706 | nDCG@5: 0.5369 | Primary: 0.6038\n"
+      },
+      "delta_over_baseline": 0.0021999999999999797,
+      "error_recovery": null,
+      "agent_trace": {
+        "directive": {
+          "phase": "initial exploration",
+          "focus_dimensions": [
+            "loss",
+            "architecture"
+          ],
+          "avoid_dimensions": [
+            "multi_task",
+            "sequence",
+            "features",
+            "capacity",
+            "optimisation"
+          ],
+          "reasoning": "Since no experiments have been conducted yet, it's crucial to explore dimensions that have never been tried to maximize coverage. Starting with 'loss' and 'architecture' will allow us to explore fundamental changes in model behavior and structure, which could lead to significant improvements. These dimensions are foundational and can provide insights into the potential of the model's core components. Avoiding dimensions that have shown dead ends or are less likely to yield immediate gains ensures efficient use of the budget.",
+          "valid_for": 3
+        },
+        "hypotheses_considered": [
+          {
+            "dimension": "architecture",
+            "hypothesis": "Testing the MMoE model with pointwise loss",
+            "mechanism": "The MMoE (Multi-gate Mixture of Experts) architecture can potentially capture complex user-item interactions by leveraging multiple expert networks, which might better model the diverse preferences within a user's impressions. Using pointwise loss can help the model focus on individual impression relevance, which is crucial for within-user ranking.",
+            "args": "--model=mmoe --loss=pointwise --embed_dim=32 --experts=4 --expert_dim=64 --lr=0.001 --epochs=12 --batch_size=8192"
+          },
+          {
+            "dimension": "loss",
+            "hypothesis": "Testing the DeepFM model with BPR loss",
+            "mechanism": "DeepFM combines the strengths of factorization machines for capturing low-order feature interactions and deep neural networks for high-order interactions. Using BPR (Bayesian Personalized Ranking) loss, which is designed for implicit feedback datasets, can enhance the model's ability to rank items within a user's impressions by directly optimizing for ranking quality.",
+            "args": "--model=deepfm --loss=bpr --embed_dim=32 --lr=0.001 --epochs=12 --batch_size=8192"
+          },
+          {
+            "dimension": "architecture",
+            "hypothesis": "Testing the DIN model with pointwise loss",
+            "mechanism": "The DIN (Deep Interest Network) model is designed to capture user interests by attending to different parts of the user's historical interactions. Using pointwise loss can help the model focus on the relevance of individual impressions, which is critical for improving within-user ranking metrics.",
+            "args": "--model=din --loss=pointwise --embed_dim=32 --lr=0.001 --epochs=12 --batch_size=8192"
+          }
+        ],
+        "chosen": {
+          "dimension": "architecture",
+          "hypothesis": "Testing the MMoE model with pointwise loss",
+          "mechanism": "The MMoE (Multi-gate Mixture of Experts) architecture can potentially capture complex user-item interactions by leveraging multiple expert networks, which might better model the diverse preferences within a user's impressions. Using pointwise loss can help the model focus on individual impression relevance, which is crucial for within-user ranking.",
+          "args": "--model=mmoe --loss=pointwise --embed_dim=32 --experts=4 --expert_dim=64 --lr=0.001 --epochs=12 --batch_size=8192",
+          "command": "/Users/pk/Documents/GitHub/RankAgent/.venv/bin/python -m pipeline.train --model=mmoe --loss=pointwise --embed_dim=32 --experts=4 --expert_dim=64 --lr=0.001 --epochs=12 --batch_size=8192 --data_dir data/KuaiRand-Pure/data",
+          "checkpoint": "mmoe",
+          "source": "llm",
+          "rejected": []
+        },
+        "rejected_by_engineer": [],
+        "preflight_problems": [],
+        "pm_refreshed": false,
+        "trace": [
+          "PM directive 'initial exploration' still current",
+          "Researcher proposed 3",
+          "QA pre-flight passed"
+        ],
+        "qa_verdict": {
+          "trustworthy": true,
+          "note": ""
+        }
+      },
+      "prompt_tokens": 981,
+      "completion_tokens": 401,
+      "llm_calls": 1,
+      "cumulative_prompt_tokens": 2450,
+      "cumulative_completion_tokens": 931,
+      "wall_clock_seconds": 38.61968398094177,
+      "manual_interventions": 0
+    },
+    {
+      "iteration_id": 3,
+      "parent_node_id": 2,
+      "node_id": 3,
+      "stage": "architecture",
+      "hypothesis": "Testing the DeepFM model with pointwise loss",
+      "rationale": "DeepFM combines the power of factorization machines for recommendation and deep learning for capturing non-linear interactions. This architecture could better capture complex patterns in user interactions, potentially improving the within-user ranking.",
+      "target_file": "pipeline/train.py",
+      "command": "/Users/pk/Documents/GitHub/RankAgent/.venv/bin/python -m pipeline.train --model=deepfm --loss=pointwise --embed_dim=32 --lr=0.001 --epochs=12 --batch_size=8192 --data_dir data/KuaiRand-Pure/data",
+      "proposal_source": "llm",
+      "code_diff": "diff --git a/kuairand-starter-kit/__pycache__/evaluate.cpython-314.pyc b/kuairand-starter-kit/__pycache__/evaluate.cpython-314.pyc\nindex d18da56..48a84ea 100644\nBinary files a/kuairand-starter-kit/__pycache__/evaluate.cpython-314.pyc and b/kuairand-starter-kit/__pycache__/evaluate.cpython-314.pyc differ\ndiff --git a/main.py b/main.py\nindex 9fc5392..3109b60 100644\n--- a/main.py\n+++ b/main.py\n@@ -10,18 +10,29 @@ def main():\n     parser.add_argument(\"--data_dir\", default=None, help=\"Path to KuaiRand-Pure dataset directory (optional, auto-detected)\")\n     parser.add_argument(\"--max_iterations\", type=int, default=None, help=\"Iteration budget (default: configs/benchmark_kuairand.yaml, hard cap 50)\")\n     parser.add_argument(\"--max_wall_clock\", type=int, default=None, help=\"Wall-clock ceiling in seconds (default: configs/benchmark_kuairand.yaml, 6h)\")\n-    parser.add_argument(\"--run_baseline\", action=\"store_true\", help=\"Explicitly re-train the Factorization Machine baseline before starting iterations\")\n+    # Baseline reproduction is ON by default: the challenge requires confirming\n+    # the official validation score before iterating, and the run log is the\n+    # evidence for it. --skip-baseline exists only for fast development loops and\n+    # marks the run as unverified in the log.\n+    parser.add_argument(\"--skip-baseline\", action=\"store_true\",\n+                        help=\"Development shortcut: seed from the published 0.6016 instead of \"\n+                             \"reproducing it (~90s). The run is then marked unverified; \"\n+                             \"do not use it for a submitted run.\")\n     args = parser.parse_args()\n \n     print(\"==================================================================\")\n     print(\"         RankAgent: Autonomous RecSys ML Research Agent           \")\n     print(\"==================================================================\")\n+    if args.skip_baseline:\n+        print(\"  WARNING: --skip-baseline set. The baseline will be asserted, not\")\n+        print(\"           reproduced, and every delta will be relative to an\")\n+        print(\"           unverified reference. Not valid for a submitted run.\")\n     \n     agent = RankAgentOrchestrator(\n         data_dir=args.data_dir,\n         max_iterations=args.max_iterations,\n         max_wall_clock=args.max_wall_clock,\n-        run_baseline=args.run_baseline\n+        run_baseline=not args.skip_baseline,\n     )\n     agent.start_loop()\n \ndiff --git a/orchestrator/schemas.py b/orchestrator/schemas.py\nindex 2abf3a3..400a6fa 100644\n--- a/orchestrator/schemas.py\n+++ b/orchestrator/schemas.py\n@@ -73,17 +73,35 @@ class IterationLogEntry(BaseModel):\n     metrics: Optional[Dict[str, Any]] = None\n     delta_over_baseline: Optional[float] = None\n     error_recovery: Optional[Dict[str, Any]] = None\n+    #: How the four agent roles arrived at this iteration's experiment: the PM's\n+    #: directive, the hypotheses considered, what the Engineer rejected and why,\n+    #: and QA's pre-flight. This is the audit trail for the multi-agent design.\n+    agent_trace: Optional[Dict[str, Any]] = None\n+    #: Spent by THIS iteration (hypothesis call plus any repair calls it made).\n     prompt_tokens: int = 0\n     completion_tokens: int = 0\n+    llm_calls: int = 0\n+    #: Running totals as of the end of this iteration, so the log reads both ways\n+    #: without a reader having to sum the column.\n+    cumulative_prompt_tokens: int = 0\n+    cumulative_completion_tokens: int = 0\n     wall_clock_seconds: float = 0.0\n     manual_interventions: int = 0\n \n+    @property\n+    def iteration_tokens(self) -> int:\n+        return self.prompt_tokens + self.completion_tokens\n+\n \n class RunSummary(BaseModel):\n     \"\"\"Everything the Feasibility and Autonomy criteria are scored on.\"\"\"\n     run_id: str\n     benchmark: str = \"KuaiRand-Pure\"\n     baseline_valid_primary: float = 0.6016\n+    #: True only if this run re-ran and verified the baseline. False means the\n+    #: reference was asserted from the published value, so every delta below is\n+    #: relative to an unverified number.\n+    baseline_reproduced: bool = False\n     best_valid_primary: Optional[float] = None\n     best_delta: Optional[float] = None\n     best_iteration: Optional[int] = None\n@@ -98,6 +116,9 @@ class RunSummary(BaseModel):\n     error_recoveries: int = 0\n     failed_iterations: int = 0\n     submission_path: Optional[str] = None\n+    #: Token spend attributed per agent role, so the cost of the multi-agent\n+    #: design is visible rather than buried in a single total.\n+    cost_by_agent: Dict[str, Dict[str, int]] = Field(default_factory=dict)\n     iterations: List[Dict[str, Any]] = Field(default_factory=list)\n \n     @property\ndiff --git a/orchestrator/state_machine.py b/orchestrator/state_machine.py\nindex 7e91ff5..35f12dc 100644\n--- a/orchestrator/state_machine.py\n+++ b/orchestrator/state_machine.py\n@@ -22,6 +22,8 @@ from typing import Any, Dict, List, Optional, Tuple\n \n import yaml\n \n+from agents.context import ResearchContext\n+from agents.team import AgentTeam\n from orchestrator.schemas import (ExecutionResult, HypothesisProposal,\n                                   IterationLogEntry, RunSummary, TokenUsage)\n from orchestrator.tree_manager import BASELINE_VAL_PRIMARY, TreeManager\n@@ -147,7 +149,7 @@ class RankAgentOrchestrator:\n     def __init__(self, data_dir: Optional[str] = None,\n                  max_iterations: Optional[int] = None,\n                  max_wall_clock: Optional[int] = None, run_id: Optional[str] = None,\n-                 run_baseline: bool = False):\n+                 run_baseline: bool = True):\n         load_dotenv_if_present()\n         agent_cfg = load_yaml(\"agent_config.yaml\")\n         bench_cfg = load_yaml(\"benchmark_kuairand.yaml\")\n@@ -155,6 +157,8 @@ class RankAgentOrchestrator:\n \n         self.data_dir = data_dir\n         self.run_baseline_flag = run_baseline\n+        #: Whether this run actually re-ran the baseline, or merely asserted it.\n+        self.baseline_reproduced = False\n         # Explicit arguments win over the YAML defaults; YAML wins over the\n         # hard-coded fallback. The previous order let the config silently\n         # override a budget the operator had asked for on the command line.\n@@ -180,6 +184,13 @@ class RankAgentOrchestrator:\n         self.logger = RunLogger(run_id=run_id)\n \n         self.tokens = TokenUsage()\n+        self.team = AgentTeam(self.tokens, data_dir=data_dir,\n+                              pm_refresh=int(agent_cfg.get(\"agent\", {}).get(\"pm_refresh\", 3)),\n+                              proposals=int(agent_cfg.get(\"agent\", {}).get(\"proposals_per_call\", 3)),\n+                              max_retries=int(dbg_cfg.get(\"max_self_healing_attempts\", 3)))\n+        self.ctx = ResearchContext(baseline=BASELINE_VAL_PRIMARY,\n+                                   max_iterations=self.max_iterations,\n+                                   wall_clock_budget_s=float(self.max_wall_clock))\n         self.manual_interventions = 0\n         self.error_recoveries = 0\n         self.failed_iterations = 0\n@@ -210,6 +221,8 @@ class RankAgentOrchestrator:\n                   f\"drift {drift:+.4f})\")\n             if drift > 0.005:\n                 print(f\"[WARN] baseline drift exceeds 0.005 \u2014 investigate before trusting deltas\")\n+            self.baseline_reproduced = True\n+            self.ctx.baseline = m.primary_score\n             self.tree.record_baseline(m.primary_score, node_id=0)\n             self.logger.log_iteration(IterationLogEntry(\n                 iteration_id=0, node_id=0, parent_node_id=None,\n@@ -354,12 +367,45 @@ class RankAgentOrchestrator:\n     def run_iteration(self, iteration_id: int) -> bool:\n         \"\"\"Execute one hypothesis. Returns whether the run should halt.\"\"\"\n         print(f\"\\n{'=' * 74}\\n>>> ITERATION {iteration_id}/{self.max_iterations}\\n{'=' * 74}\")\n-        proposal = self.propose(iteration_id)\n-        command = self._with_data_dir(proposal.command)\n-        self._used_commands.add(p\n\u2026 truncated \u2026",
+      "status": "REJECTED",
+      "metrics": {
+        "gauc": 0.6667,
+        "ndcg_5": 0.5351,
+        "primary_score": 0.6009,
+        "delta_from_baseline": -0.0007000000000000339,
+        "raw_stdout": "==> loading KuaiRand-Pure (train + valid; hidden test is sealed)\n{'train': 1141112, 'valid': 124909}\n==> deepfm | loss=pointwise | dim=32 | fields=5 | cpu\n  epoch  1 | loss 0.5431 | valid GAUC 0.6661 nDCG@5 0.5352 primary 0.6006 | 2.2s\n  epoch  2 | loss 0.5059 | valid GAUC 0.6667 nDCG@5 0.5351 primary 0.6009 | 1.9s\n  epoch  3 | loss 0.4908 | valid GAUC 0.6626 nDCG@5 0.5329 primary 0.5978 | 1.9s\n  epoch  4 | loss 0.4724 | valid GAUC 0.6496 nDCG@5 0.5278 primary 0.5887 | 1.9s\n  epoch  5 | loss 0.4472 | valid GAUC 0.6420 nDCG@5 0.5239 primary 0.5829 | 1.9s\n  early stop at epoch 5\n[EVAL] GAUC: 0.6667 | nDCG@5: 0.5351 | Primary: 0.6009\n"
+      },
+      "delta_over_baseline": -0.0007000000000000339,
+      "error_recovery": null,
+      "agent_trace": {
+        "directive": {
+          "phase": "initial exploration",
+          "focus_dimensions": [
+            "loss",
+            "architecture"
+          ],
+          "avoid_dimensions": [
+            "multi_task",
+            "sequence",
+            "features",
+            "capacity",
+            "optimisation"
+          ],
+          "reasoning": "Since no experiments have been conducted yet, it's crucial to explore dimensions that have never been tried to maximize coverage. Starting with 'loss' and 'architecture' will allow us to explore fundamental changes in model behavior and structure, which could lead to significant improvements. These dimensions are foundational and can provide insights into the potential of the model's core components. Avoiding dimensions that have shown dead ends or are less likely to yield immediate gains ensures efficient use of the budget.",
+          "valid_for": 3
+        },
+        "hypotheses_considered": [
+          {
+            "dimension": "architecture",
+            "hypothesis": "Testing the DeepFM model with pointwise loss",
+            "mechanism": "DeepFM combines the power of factorization machines for recommendation and deep learning for capturing non-linear interactions. This architecture could better capture complex patterns in user interactions, potentially improving the within-user ranking.",
+            "args": "--model=deepfm --loss=pointwise --embed_dim=32 --lr=0.001 --epochs=12 --batch_size=8192"
+          },
+          {
+            "dimension": "loss",
+            "hypothesis": "Testing the MMOE model with listwise loss",
+            "mechanism": "Listwise loss functions consider the entire list of items for a user, which may better optimize the ranking order within a user's impressions compared to pointwise loss. This could lead to better alignment with the evaluation metrics.",
+            "args": "--model=mmoe --loss=listwise --embed_dim=32 --experts=4 --expert_dim=64 --lr=0.001 --epochs=12 --batch_size=8192"
+          },
+          {
+            "dimension": "architecture",
+            "hypothesis": "Testing the DIN model with pointwise loss",
+            "mechanism": "The DIN model is designed to capture user interest evolution by focusing on relevant parts of the user's history. Using pointwise loss might help in fine-tuning the model to better predict individual user-item interactions, potentially improving rankings.",
+            "args": "--model=din --loss=pointwise --embed_dim=32 --lr=0.001 --epochs=12 --batch_size=8192"
+          }
+        ],
+        "chosen": {
+          "dimension": "architecture",
+          "hypothesis": "Testing the DeepFM model with pointwise loss",
+          "mechanism": "DeepFM combines the power of factorization machines for recommendation and deep learning for capturing non-linear interactions. This architecture could better capture complex patterns in user interactions, potentially improving the within-user ranking.",
+          "args": "--model=deepfm --loss=pointwise --embed_dim=32 --lr=0.001 --epochs=12 --batch_size=8192",
+          "command": "/Users/pk/Documents/GitHub/RankAgent/.venv/bin/python -m pipeline.train --model=deepfm --loss=pointwise --embed_dim=32 --lr=0.001 --epochs=12 --batch_size=8192 --data_dir data/KuaiRand-Pure/data",
+          "checkpoint": "deepfm_pointwise",
+          "source": "llm",
+          "rejected": []
+        },
+        "rejected_by_engineer": [],
+        "preflight_problems": [],
+        "pm_refreshed": false,
+        "trace": [
+          "PM directive 'initial exploration' still current",
+          "Researcher proposed 3",
+          "QA pre-flight passed"
+        ],
+        "qa_verdict": {
+          "trustworthy": true,
+          "note": ""
+        }
+      },
+      "prompt_tokens": 1071,
+      "completion_tokens": 349,
+      "llm_calls": 1,
+      "cumulative_prompt_tokens": 3521,
+      "cumulative_completion_tokens": 1280,
+      "wall_clock_seconds": 17.094840049743652,
+      "manual_interventions": 0
+    },
+    {
+      "iteration_id": 4,
+      "parent_node_id": 2,
+      "node_id": 4,
+      "stage": "loss",
+      "hypothesis": "Testing listwise loss with a different model to explore its impact on ranking metrics.",
+      "rationale": "Listwise loss considers the entire list of impressions for a user, potentially capturing dependencies between items that pointwise loss might miss, which could improve within-user ranking.",
+      "target_file": "pipeline/train.py",
+      "command": "/Users/pk/Documents/GitHub/RankAgent/.venv/bin/python -m pipeline.train --model=fm_torch --loss=listwise --embed_dim=32 --epochs=12 --lr=0.001 --batch_size=8192 --data_dir data/KuaiRand-Pure/data",
+      "proposal_source": "llm",
+      "code_diff": "diff --git a/kuairand-starter-kit/__pycache__/evaluate.cpython-314.pyc b/kuairand-starter-kit/__pycache__/evaluate.cpython-314.pyc\nindex d18da56..48a84ea 100644\nBinary files a/kuairand-starter-kit/__pycache__/evaluate.cpython-314.pyc and b/kuairand-starter-kit/__pycache__/evaluate.cpython-314.pyc differ\ndiff --git a/main.py b/main.py\nindex 9fc5392..3109b60 100644\n--- a/main.py\n+++ b/main.py\n@@ -10,18 +10,29 @@ def main():\n     parser.add_argument(\"--data_dir\", default=None, help=\"Path to KuaiRand-Pure dataset directory (optional, auto-detected)\")\n     parser.add_argument(\"--max_iterations\", type=int, default=None, help=\"Iteration budget (default: configs/benchmark_kuairand.yaml, hard cap 50)\")\n     parser.add_argument(\"--max_wall_clock\", type=int, default=None, help=\"Wall-clock ceiling in seconds (default: configs/benchmark_kuairand.yaml, 6h)\")\n-    parser.add_argument(\"--run_baseline\", action=\"store_true\", help=\"Explicitly re-train the Factorization Machine baseline before starting iterations\")\n+    # Baseline reproduction is ON by default: the challenge requires confirming\n+    # the official validation score before iterating, and the run log is the\n+    # evidence for it. --skip-baseline exists only for fast development loops and\n+    # marks the run as unverified in the log.\n+    parser.add_argument(\"--skip-baseline\", action=\"store_true\",\n+                        help=\"Development shortcut: seed from the published 0.6016 instead of \"\n+                             \"reproducing it (~90s). The run is then marked unverified; \"\n+                             \"do not use it for a submitted run.\")\n     args = parser.parse_args()\n \n     print(\"==================================================================\")\n     print(\"         RankAgent: Autonomous RecSys ML Research Agent           \")\n     print(\"==================================================================\")\n+    if args.skip_baseline:\n+        print(\"  WARNING: --skip-baseline set. The baseline will be asserted, not\")\n+        print(\"           reproduced, and every delta will be relative to an\")\n+        print(\"           unverified reference. Not valid for a submitted run.\")\n     \n     agent = RankAgentOrchestrator(\n         data_dir=args.data_dir,\n         max_iterations=args.max_iterations,\n         max_wall_clock=args.max_wall_clock,\n-        run_baseline=args.run_baseline\n+        run_baseline=not args.skip_baseline,\n     )\n     agent.start_loop()\n \ndiff --git a/orchestrator/schemas.py b/orchestrator/schemas.py\nindex 2abf3a3..400a6fa 100644\n--- a/orchestrator/schemas.py\n+++ b/orchestrator/schemas.py\n@@ -73,17 +73,35 @@ class IterationLogEntry(BaseModel):\n     metrics: Optional[Dict[str, Any]] = None\n     delta_over_baseline: Optional[float] = None\n     error_recovery: Optional[Dict[str, Any]] = None\n+    #: How the four agent roles arrived at this iteration's experiment: the PM's\n+    #: directive, the hypotheses considered, what the Engineer rejected and why,\n+    #: and QA's pre-flight. This is the audit trail for the multi-agent design.\n+    agent_trace: Optional[Dict[str, Any]] = None\n+    #: Spent by THIS iteration (hypothesis call plus any repair calls it made).\n     prompt_tokens: int = 0\n     completion_tokens: int = 0\n+    llm_calls: int = 0\n+    #: Running totals as of the end of this iteration, so the log reads both ways\n+    #: without a reader having to sum the column.\n+    cumulative_prompt_tokens: int = 0\n+    cumulative_completion_tokens: int = 0\n     wall_clock_seconds: float = 0.0\n     manual_interventions: int = 0\n \n+    @property\n+    def iteration_tokens(self) -> int:\n+        return self.prompt_tokens + self.completion_tokens\n+\n \n class RunSummary(BaseModel):\n     \"\"\"Everything the Feasibility and Autonomy criteria are scored on.\"\"\"\n     run_id: str\n     benchmark: str = \"KuaiRand-Pure\"\n     baseline_valid_primary: float = 0.6016\n+    #: True only if this run re-ran and verified the baseline. False means the\n+    #: reference was asserted from the published value, so every delta below is\n+    #: relative to an unverified number.\n+    baseline_reproduced: bool = False\n     best_valid_primary: Optional[float] = None\n     best_delta: Optional[float] = None\n     best_iteration: Optional[int] = None\n@@ -98,6 +116,9 @@ class RunSummary(BaseModel):\n     error_recoveries: int = 0\n     failed_iterations: int = 0\n     submission_path: Optional[str] = None\n+    #: Token spend attributed per agent role, so the cost of the multi-agent\n+    #: design is visible rather than buried in a single total.\n+    cost_by_agent: Dict[str, Dict[str, int]] = Field(default_factory=dict)\n     iterations: List[Dict[str, Any]] = Field(default_factory=list)\n \n     @property\ndiff --git a/orchestrator/state_machine.py b/orchestrator/state_machine.py\nindex 7e91ff5..35f12dc 100644\n--- a/orchestrator/state_machine.py\n+++ b/orchestrator/state_machine.py\n@@ -22,6 +22,8 @@ from typing import Any, Dict, List, Optional, Tuple\n \n import yaml\n \n+from agents.context import ResearchContext\n+from agents.team import AgentTeam\n from orchestrator.schemas import (ExecutionResult, HypothesisProposal,\n                                   IterationLogEntry, RunSummary, TokenUsage)\n from orchestrator.tree_manager import BASELINE_VAL_PRIMARY, TreeManager\n@@ -147,7 +149,7 @@ class RankAgentOrchestrator:\n     def __init__(self, data_dir: Optional[str] = None,\n                  max_iterations: Optional[int] = None,\n                  max_wall_clock: Optional[int] = None, run_id: Optional[str] = None,\n-                 run_baseline: bool = False):\n+                 run_baseline: bool = True):\n         load_dotenv_if_present()\n         agent_cfg = load_yaml(\"agent_config.yaml\")\n         bench_cfg = load_yaml(\"benchmark_kuairand.yaml\")\n@@ -155,6 +157,8 @@ class RankAgentOrchestrator:\n \n         self.data_dir = data_dir\n         self.run_baseline_flag = run_baseline\n+        #: Whether this run actually re-ran the baseline, or merely asserted it.\n+        self.baseline_reproduced = False\n         # Explicit arguments win over the YAML defaults; YAML wins over the\n         # hard-coded fallback. The previous order let the config silently\n         # override a budget the operator had asked for on the command line.\n@@ -180,6 +184,13 @@ class RankAgentOrchestrator:\n         self.logger = RunLogger(run_id=run_id)\n \n         self.tokens = TokenUsage()\n+        self.team = AgentTeam(self.tokens, data_dir=data_dir,\n+                              pm_refresh=int(agent_cfg.get(\"agent\", {}).get(\"pm_refresh\", 3)),\n+                              proposals=int(agent_cfg.get(\"agent\", {}).get(\"proposals_per_call\", 3)),\n+                              max_retries=int(dbg_cfg.get(\"max_self_healing_attempts\", 3)))\n+        self.ctx = ResearchContext(baseline=BASELINE_VAL_PRIMARY,\n+                                   max_iterations=self.max_iterations,\n+                                   wall_clock_budget_s=float(self.max_wall_clock))\n         self.manual_interventions = 0\n         self.error_recoveries = 0\n         self.failed_iterations = 0\n@@ -210,6 +221,8 @@ class RankAgentOrchestrator:\n                   f\"drift {drift:+.4f})\")\n             if drift > 0.005:\n                 print(f\"[WARN] baseline drift exceeds 0.005 \u2014 investigate before trusting deltas\")\n+            self.baseline_reproduced = True\n+            self.ctx.baseline = m.primary_score\n             self.tree.record_baseline(m.primary_score, node_id=0)\n             self.logger.log_iteration(IterationLogEntry(\n                 iteration_id=0, node_id=0, parent_node_id=None,\n@@ -354,12 +367,45 @@ class RankAgentOrchestrator:\n     def run_iteration(self, iteration_id: int) -> bool:\n         \"\"\"Execute one hypothesis. Returns whether the run should halt.\"\"\"\n         print(f\"\\n{'=' * 74}\\n>>> ITERATION {iteration_id}/{self.max_iterations}\\n{'=' * 74}\")\n-        proposal = self.propose(iteration_id)\n-        command = self._with_data_dir(proposal.command)\n-        self._used_commands.add(p\n\u2026 truncated \u2026",
+      "status": "REJECTED",
+      "metrics": {
+        "gauc": 0.6672,
+        "ndcg_5": 0.5364,
+        "primary_score": 0.6018,
+        "delta_from_baseline": 0.00019999999999997797,
+        "raw_stdout": "==> loading KuaiRand-Pure (train + valid; hidden test is sealed)\n{'train': 1141112, 'valid': 124909}\n==> fm_torch | loss=listwise | dim=32 | fields=5 | cpu\n  epoch  1 | loss 3.6712 | valid GAUC 0.6623 nDCG@5 0.5334 primary 0.5978 | 1.0s\n  epoch  2 | loss 3.6202 | valid GAUC 0.6659 nDCG@5 0.5346 primary 0.6003 | 0.9s\n  epoch  3 | loss 3.6114 | valid GAUC 0.6672 nDCG@5 0.5364 primary 0.6018 | 1.0s\n  epoch  4 | loss 3.6050 | valid GAUC 0.6661 nDCG@5 0.5353 primary 0.6007 | 1.0s\n  epoch  5 | loss 3.5968 | valid GAUC 0.6672 nDCG@5 0.5355 primary 0.6014 | 0.9s\n  epoch  6 | loss 3.5855 | valid GAUC 0.6635 nDCG@5 0.5343 primary 0.5989 | 0.9s\n  early stop at epoch 6\n[EVAL] GAUC: 0.6672 | nDCG@5: 0.5364 | Primary: 0.6018\n"
+      },
+      "delta_over_baseline": 0.00019999999999997797,
+      "error_recovery": null,
+      "agent_trace": {
+        "directive": {
+          "phase": "Exploration of Untested Dimensions",
+          "focus_dimensions": [
+            "loss",
+            "multi_task"
+          ],
+          "avoid_dimensions": [
+            "architecture",
+            "capacity",
+            "features"
+          ],
+          "reasoning": "The current best score has not shown significant improvement over the baseline, and recent iterations have focused solely on the architecture dimension. To maximize coverage and explore untested areas, we should focus on the loss and multi_task dimensions, which have not been tried yet. This approach will help us avoid local optima and potentially uncover new insights that could lead to significant improvements. We avoid architecture as it has been explored multiple times, and capacity and features as they have been identified as dead ends.",
+          "valid_for": 3
+        },
+        "hypotheses_considered": [
+          {
+            "dimension": "loss",
+            "hypothesis": "Testing listwise loss with a different model to explore its impact on ranking metrics.",
+            "mechanism": "Listwise loss considers the entire list of impressions for a user, potentially capturing dependencies between items that pointwise loss might miss, which could improve within-user ranking.",
+            "args": "--model=fm_torch --loss=listwise --embed_dim=32 --epochs=12 --lr=0.001 --batch_size=8192"
+          },
+          {
+            "dimension": "multi_task",
+            "hypothesis": "Exploring multi-task learning with auxiliary tasks to improve the main ranking task.",
+            "mechanism": "Multi-task learning can leverage auxiliary tasks to share representations and regularize the model, potentially improving generalization and thus within-user ranking performance.",
+            "args": "--model=mmoe --loss=pointwise --embed_dim=32 --epochs=12 --lr=0.001 --batch_size=8192 --experts=6 --expert_dim=96 --aux_weight=0.3"
+          },
+          {
+            "dimension": "loss",
+            "hypothesis": "Testing BPR loss to evaluate its impact on ranking metrics.",
+            "mechanism": "BPR loss is designed for implicit feedback and optimizes for pairwise ranking, which might better capture user preferences within their impression list compared to pointwise loss.",
+            "args": "--model=deepfm --loss=bpr --embed_dim=32 --epochs=12 --lr=0.001 --batch_size=8192"
+          }
+        ],
+        "chosen": {
+          "dimension": "loss",
+          "hypothesis": "Testing listwise loss with a different model to explore its impact on ranking metrics.",
+          "mechanism": "Listwise loss considers the entire list of impressions for a user, potentially capturing dependencies between items that pointwise loss might miss, which could improve within-user ranking.",
+          "args": "--model=fm_torch --loss=listwise --embed_dim=32 --epochs=12 --lr=0.001 --batch_size=8192",
+          "command": "/Users/pk/Documents/GitHub/RankAgent/.venv/bin/python -m pipeline.train --model=fm_torch --loss=listwise --embed_dim=32 --epochs=12 --lr=0.001 --batch_size=8192 --data_dir data/KuaiRand-Pure/data",
+          "checkpoint": "fm_torch_listwise",
+          "source": "llm",
+          "rejected": []
+        },
+        "rejected_by_engineer": [],
+        "preflight_problems": [],
+        "pm_refreshed": true,
+        "trace": [
+          "PM set phase 'Exploration of Untested Dimensions'",
+          "Researcher proposed 3",
+          "QA pre-flight passed"
+        ],
+        "qa_verdict": {
+          "trustworthy": true,
+          "note": ""
+        }
+      },
+      "prompt_tokens": 1908,
+      "completion_tokens": 489,
+      "llm_calls": 2,
+      "cumulative_prompt_tokens": 5429,
+      "cumulative_completion_tokens": 1769,
+      "wall_clock_seconds": 13.294062852859497,
+      "manual_interventions": 0
+    },
+    {
+      "iteration_id": 5,
+      "parent_node_id": 2,
+      "node_id": 5,
+      "stage": "Planning",
+      "hypothesis": "No runnable experiment could be produced.",
+      "rationale": "PM directive 'Exploration of Untested Dimensions' still current; Researcher proposed 3; QA blocked: hypothesis does not mention the model the command runs",
+      "target_file": "-",
+      "command": "(none)",
+      "proposal_source": "fallback",
+      "code_diff": "",
+      "status": "FAILED",
+      "metrics": null,
+      "delta_over_baseline": null,
+      "error_recovery": null,
+      "agent_trace": {
+        "directive": {
+          "phase": "Exploration of Untested Dimensions",
+          "focus_dimensions": [
+            "loss",
+            "multi_task"
+          ],
+          "avoid_dimensions": [
+            "architecture",
+            "capacity",
+            "features"
+          ],
+          "reasoning": "The current best score has not shown significant improvement over the baseline, and recent iterations have focused solely on the architecture dimension. To maximize coverage and explore untested areas, we should focus on the loss and multi_task dimensions, which have not been tried yet. This approach will help us avoid local optima and potentially uncover new insights that could lead to significant improvements. We avoid architecture as it has been explored multiple times, and capacity and features as they have been identified as dead ends.",
+          "valid_for": 3
+        },
+        "hypotheses_considered": [
+          {
+            "dimension": "loss",
+            "hypothesis": "Testing the impact of BPR loss on within-user ranking performance.",
+            "mechanism": "BPR loss is designed to optimize pairwise ranking, which could improve the ordering of impressions within a user by directly optimizing for relative preferences rather than absolute scores.",
+            "args": "--model=deepfm --loss=bpr --batch_size=8192 --embed_dim=32 --epochs=12 --lr=0.001"
+          },
+          {
+            "dimension": "multi_task",
+            "hypothesis": "Exploring the effect of auxiliary task weighting on the primary ranking task.",
+            "mechanism": "Adjusting the auxiliary task weight can help balance the learning focus between the main and auxiliary tasks, potentially improving the model's ability to generalize user preferences within their own impressions.",
+            "args": "--model=mmoe --loss=pointwise --aux_weight=0.3 --batch_size=8192 --embed_dim=32 --epochs=12 --lr=0.001 --experts=4 --expert_dim=64"
+          },
+          {
+            "dimension": "loss",
+            "hypothesis": "Evaluating the effectiveness of listwise loss with a different model architecture.",
+            "mechanism": "Using listwise loss with a model like deepfm might leverage the listwise approach's strength in capturing the overall ranking of items within a user, potentially improving the primary metric.",
+            "args": "--model=deepfm --loss=listwise --batch_size=8192 --embed_dim=32 --epochs=12 --lr=0.001"
+          }
+        ],
+        "chosen": null,
+        "rejected_by_engineer": [],
+        "preflight_problems": [
+          "hypothesis does not mention the model the command runs"
+        ],
+        "pm_refreshed": false,
+        "trace": [
+          "PM directive 'Exploration of Untested Dimensions' still current",
+          "Researcher proposed 3",
+          "QA blocked: hypothesis does not mention the model the command runs"
+        ]
+      },
+      "prompt_tokens": 1229,
+      "completion_tokens": 347,
+      "llm_calls": 1,
+      "cumulative_prompt_tokens": 6658,
+      "cumulative_completion_tokens": 2116,
+      "wall_clock_seconds": 0.0,
+      "manual_interventions": 0
+    }
+  ],
+  "total_tokens": 8774
+}

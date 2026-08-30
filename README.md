@@ -12,7 +12,7 @@
 
 ## 📌 Table of Contents
 - [1. Project Overview & State Machine](#1-project-overview--state-machine)
-- [2. System Architecture & Subsystem Ownership](#2-system-architecture--subsystem-ownership)
+- [2. System Architecture — Four Specialised Agents](#2-system-architecture--four-specialised-agents)
 - [3. Benchmark & Metric Specification](#3-benchmark--metric-specification)
 - [4. Repository & File Partitioning](#4-repository--file-partitioning)
 - [5. Setup & Reproduction](#5-setup--reproduction)
@@ -42,36 +42,64 @@ graph TD
 
 ---
 
-## 2. System Architecture & Subsystem Ownership
+## 2. System Architecture — Four Specialised Agents
+
+RankAgent runs its loop as four agents coordinating over a shared **blackboard**,
+rather than one prompt doing domain reasoning, code generation and debugging at once.
 
 ```
-+-----------------------------------------------------------------------------------+
-|                        MEMBER 1: Tree Search Orchestrator                         |
-|   State Machine: INIT -> HYPOTHESIZE -> GENERATE -> RUN -> EVAL -> REFLECT/PRUNE  |
-|   Convergence Trigger: Halts if primary score improvement < 0.002 over 3 iters    |
-+--------------------+------------------------------------+-------------------------+
-                     |                                    |
-                     v                                    v
-+------------------------------------+   +------------------------------------------+
-| MEMBER 3: Prompt Engine & KB       |   | MEMBER 2: Execution Sandbox & Telemetry  |
-| - KuaiRand KB (Duration Bias, MTL) |   | - Subprocess Runner with 6-hour ceiling  |
-| - Hypothesis Generator             |   | - Parse GAUC & nDCG@5 from evaluate.py   |
-| - Code Generation Prompts          |   | - Self-Healing Loop (Max 3 retries)      |
-| - Debugger & Reflection Templates  |   | - run_summary.json Telemetry Tracker     |
-+--------------------+---------------+   +--------------------+---------------------+
-                     |                                        |
-                     +-------------------+--------------------+
-                                         |
-                                         v
-+-----------------------------------------------------------------------------------+
-|               MEMBER 4: Modularized KuaiRand Pipeline (pipeline/)                 |
-| - data.py (Strict Date-Based Splits: Train 0408-0421, Val 0422-0428)              |
-| - features.py (12 Auxiliary Signals, Dense/Sparse Embeddings)                     |
-| - models.py (Agent-modified: FM -> DeepFM -> Multi-Task Architectures)            |
-| - train.py (Loss Balancing for `long_view` + auxiliary tasks)                     |
-| - evaluate.py (Official Starter Kit Evaluator: GAUC, nDCG@5, Submission CSV)      |
-| - submit.py (Strict row_id, user_id, video_id, score CSV Exporter)                |
-+-----------------------------------------------------------------------------------+
+        ┌──────────────────────────────────────────────┐
+        │            Product Manager Agent             │   owns COVERAGE
+        │   which axis to work on; when to rotate      │   runs every N iters
+        └───────────────────────┬──────────────────────┘
+        ┌───────────────────────▼──────────────────────┐
+        │             ML Research Agent                │   owns HYPOTHESES
+        │   what to try, and the mechanism why         │   k per call
+        └───────────────────────┬──────────────────────┘
+        ┌───────────────────────▼──────────────────────┐
+        │            Engineer (SWE) Agent              │   owns RUNNABILITY
+        │   validates against the REAL argparse spec   │   rejects duplicates
+        └───────────────────────┬──────────────────────┘
+        ┌───────────────────────▼──────────────────────┐
+        │            QA & Debugger Agent               │   owns TRUST
+        │   pre-flight, result verdicts, self-healing  │
+        └──────────────────────────────────────────────┘
+
+              all four read/write one ResearchContext
+```
+
+**Why a blackboard, not a pipeline.** In a chain each handoff is a lossy
+paraphrase. An earlier single-agent run logged a hypothesis about DCN-v2 while
+executing `--model mmoe`; a four-stage chain would give that drift three more
+places to happen. Here agents exchange typed objects, never prose.
+
+**What each role prevents.** Every split is traceable to a logged failure:
+
+| Role | Failure it prevents |
+| :--- | :--- |
+| Product Manager | A run that spent 4 iterations on one axis and **never varied the loss** — the strongest measured lever. Tracks 7 dimensions, directs at untried ones, rotates when stalled. |
+| Researcher | Hypotheses without mechanisms; re-deriving the organizers' measured dead ends. |
+| Engineer | A logged hypothesis that doesn't match the command that ran. Every command is parsed against the real spec and checked against history. |
+| QA | Trusting a broken result. Rejects scores below the random floor (0.4834) or above the oracle ceiling (0.8484). |
+
+**Cost control.** Naively four calls per iteration would push the run into the
+most expensive Feasibility tier for no gain. The PM runs every 3 iterations, the
+Researcher returns several hypotheses per call, and Engineer and QA only call out
+on failure. A measured 5-iteration run used **7 calls, 8,774 tokens** — roughly
+1.4 calls per iteration — attributed per role in `RunSummary.cost_by_agent`.
+
+**Without an API key** every agent has a deterministic fallback and the whole team
+runs at zero tokens, covering all 7 dimensions in 10 iterations.
+
+Full detail: [`docs/AGENT_ARCHITECTURE.md`](docs/AGENT_ARCHITECTURE.md).
+
+### Supporting subsystems
+
+```
+orchestrator/   FSM loop, exploration tree, convergence rule, Pydantic contracts
+sandbox/        subprocess runner (one framework per process), parser, logger
+pipeline/       data (hidden-test sealed), features (causal), models, train, submit
+agents/         the four roles + blackboard + playbook
 ```
 
 ---
@@ -258,6 +286,7 @@ real; the submission passes the organizer's checker.
 
 ## 8. Documentation Index
 
+* [`docs/AGENT_ARCHITECTURE.md`](docs/AGENT_ARCHITECTURE.md): The four-agent design, the blackboard, and the measured failure each role prevents.
 * [`docs/ARCHITECTURE_DESIGN.md`](docs/ARCHITECTURE_DESIGN.md): Detailed subsystem designs, Pydantic schemas, and state machine workflows.
 * [`docs/EXPERIMENT_STRATEGY.md`](docs/EXPERIMENT_STRATEGY.md): Phased RecSys exploration roadmap and prompt-ready domain playbook.
 * [`docs/RUN_LOG_SPEC.md`](docs/RUN_LOG_SPEC.md): Standardized JSON and Markdown schemas for hackathon run-logs.

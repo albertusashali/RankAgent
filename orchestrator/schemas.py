@@ -73,10 +73,24 @@ class IterationLogEntry(BaseModel):
     metrics: Optional[Dict[str, Any]] = None
     delta_over_baseline: Optional[float] = None
     error_recovery: Optional[Dict[str, Any]] = None
+    #: How the four agent roles arrived at this iteration's experiment: the PM's
+    #: directive, the hypotheses considered, what the Engineer rejected and why,
+    #: and QA's pre-flight. This is the audit trail for the multi-agent design.
+    agent_trace: Optional[Dict[str, Any]] = None
+    #: Spent by THIS iteration (hypothesis call plus any repair calls it made).
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    llm_calls: int = 0
+    #: Running totals as of the end of this iteration, so the log reads both ways
+    #: without a reader having to sum the column.
+    cumulative_prompt_tokens: int = 0
+    cumulative_completion_tokens: int = 0
     wall_clock_seconds: float = 0.0
     manual_interventions: int = 0
+
+    @property
+    def iteration_tokens(self) -> int:
+        return self.prompt_tokens + self.completion_tokens
 
 
 class RunSummary(BaseModel):
@@ -84,6 +98,10 @@ class RunSummary(BaseModel):
     run_id: str
     benchmark: str = "KuaiRand-Pure"
     baseline_valid_primary: float = 0.6016
+    #: True only if this run re-ran and verified the baseline. False means the
+    #: reference was asserted from the published value, so every delta below is
+    #: relative to an unverified number.
+    baseline_reproduced: bool = False
     best_valid_primary: Optional[float] = None
     best_delta: Optional[float] = None
     best_iteration: Optional[int] = None
@@ -98,6 +116,9 @@ class RunSummary(BaseModel):
     error_recoveries: int = 0
     failed_iterations: int = 0
     submission_path: Optional[str] = None
+    #: Token spend attributed per agent role, so the cost of the multi-agent
+    #: design is visible rather than buried in a single total.
+    cost_by_agent: Dict[str, Dict[str, int]] = Field(default_factory=dict)
     iterations: List[Dict[str, Any]] = Field(default_factory=list)
 
     @property

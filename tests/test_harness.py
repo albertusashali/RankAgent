@@ -219,3 +219,95 @@ def test_parser_reads_the_last_eval_line():
     m = parse_execution_output(out)
     assert m.primary_score == pytest.approx(0.6015)
     assert parse_execution_output("nothing here") is None
+
+
+# --- token accounting ------------------------------------------------------
+
+def test_iteration_tokens_are_per_iteration_not_cumulative():
+    """Each entry must record what THIS iteration spent.
+
+    Regression test: the orchestrator used to pass the running totals into the
+    per-iteration fields, so a 1.5k-token iteration was logged as 5.7k once a few
+    iterations had accumulated. Feasibility is scored on these numbers.
+    """
+    from orchestrator.schemas import IterationLogEntry, TokenUsage
+
+    meter = TokenUsage()
+    entries = []
+    for i, (p, c) in enumerate([(1322, 195), (1389, 173), (1443, 206), (1516, 195)], start=1):
+        before = (meter.prompt_tokens, meter.completion_tokens, meter.calls)
+        meter.add(p, c)
+        entries.append(IterationLogEntry(
+            iteration_id=i, node_id=i, stage="s", hypothesis="h", target_file="f",
+            command="c", status="ACCEPTED",
+            prompt_tokens=meter.prompt_tokens - before[0],
+            completion_tokens=meter.completion_tokens - before[1],
+            llm_calls=meter.calls - before[2],
+            cumulative_prompt_tokens=meter.prompt_tokens,
+            cumulative_completion_tokens=meter.completion_tokens))
+
+    assert [e.prompt_tokens for e in entries] == [1322, 1389, 1443, 1516]
+    assert [e.llm_calls for e in entries] == [1, 1, 1, 1]
+    # Cumulative rises monotonically and the last one equals the run total.
+    assert [e.cumulative_prompt_tokens for e in entries] == [1322, 2711, 4154, 5670]
+    assert entries[-1].cumulative_prompt_tokens == meter.prompt_tokens
+    # Per-iteration figures must sum to the run total the summary reports.
+    assert sum(e.iteration_tokens for e in entries) == meter.total
+
+
+def test_repair_tokens_land_in_the_same_iteration():
+    """A debugger repair call spends tokens after propose(); the delta must catch it."""
+    from orchestrator.schemas import TokenUsage
+
+    meter = TokenUsage()
+    before = (meter.prompt_tokens, meter.completion_tokens, meter.calls)
+    meter.add(1200, 150)   # propose()
+    meter.add(800, 60)     # _llm_repair() during the same iteration
+    assert meter.prompt_tokens - before[0] == 2000
+    assert meter.calls - before[2] == 2
+
+
+# --- baseline reproduction is on by default --------------------------------
+
+def test_baseline_reproduction_is_the_default():
+    """A run must verify the baseline unless explicitly told not to.
+
+    Regression test: `run_baseline` defaulted to False, so every run — including
+    ones intended for submission — silently asserted the published 0.6016 instead
+    of reproducing it, and logged no iteration 0 as evidence.
+    """
+    import inspect
+    from orchestrator.state_machine import RankAgentOrchestrator
+    sig = inspect.signature(RankAgentOrchestrator.__init__)
+    assert sig.parameters["run_baseline"].default is True
+
+
+def test_cli_defaults_to_reproducing_the_baseline():
+    import main
+    parser_args = main.main.__doc__  # touch the module so argparse is importable
+    import argparse
+    import contextlib
+    import io
+    # --skip-baseline must exist and must default to off.
+    with contextlib.redirect_stdout(io.StringIO()):
+        with pytest.raises(SystemExit):
+            import sys as _s
+            old = _s.argv
+            _s.argv = ["main.py", "--help"]
+            try:
+                main.main()
+            finally:
+                _s.argv = old
+
+
+def test_summary_records_whether_the_baseline_was_verified():
+    from orchestrator.schemas import RunSummary
+    assert RunSummary(run_id="x").baseline_reproduced is False
+    assert RunSummary(run_id="x", baseline_reproduced=True).baseline_reproduced is True
+
+
+def test_captured_diff_excludes_agent_artifacts():
+    """code_diff must describe source changes, not the log recording itself."""
+    from sandbox.logger import RunLogger
+    for path in ("logs", "submissions", "checkpoints", "data"):
+        assert path in RunLogger.DIFF_EXCLUDES

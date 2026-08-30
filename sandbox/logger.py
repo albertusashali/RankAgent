@@ -31,26 +31,49 @@ class RunLogger:
         os.makedirs(log_dir, exist_ok=True)
         self.json_path = os.path.join(log_dir, "run_summary.json")
         self.md_path = os.path.join(log_dir, "run_log.md")
+
+        # Every run also lands under its own id. The canonical paths above are
+        # overwritten by each new run, so without this an experiment you intend
+        # to submit is one `make agent` away from being destroyed.
+        self.archive_dir = os.path.join(log_dir, "runs")
+        os.makedirs(self.archive_dir, exist_ok=True)
+        self.archive_json = os.path.join(self.archive_dir, f"{self.run_id}.json")
+        self.archive_md = os.path.join(self.archive_dir, f"{self.run_id}.md")
         self.entries: List[Dict] = []
         #: iteration id -> checkpoint name, so the submission step can find the winner.
         self._checkpoints: Dict[int, str] = {}
         self._init_md()
 
     def _init_md(self):
-        with open(self.md_path, "w", encoding="utf-8") as f:
-            f.write(f"# RankAgent run log\n\n"
-                    f"- **Run ID**: `{self.run_id}`\n"
-                    f"- **Started**: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                    f"- **Benchmark**: KuaiRand-Pure — validation selection only, "
-                    f"hidden test sealed until submission\n\n---\n\n")
+        header = (f"# RankAgent run log\n\n"
+                  f"- **Run ID**: `{self.run_id}`\n"
+                  f"- **Started**: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                  f"- **Benchmark**: KuaiRand-Pure — validation selection only, "
+                  f"hidden test sealed until submission\n\n---\n\n")
+        for path in (self.md_path, self.archive_md):
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(header)
 
     # -- diffs -------------------------------------------------------------
 
+    #: Paths the agent's own bookkeeping writes to. Excluded from the captured
+    #: diff because including them makes the field self-referential: the log
+    #: records a diff of the log, which contains the previous diff of the log.
+    #: In practice that consumed the entire size budget with churn and left every
+    #: iteration's `code_diff` byte-identical and uninformative.
+    DIFF_EXCLUDES = ("logs", "submissions", "checkpoints", "data")
+
     def capture_diff(self, max_chars: int = 8000) -> str:
-        """The working-tree diff at this moment, as the agent left it."""
+        """The working-tree diff at this moment, as the agent left it.
+
+        Only source changes — the agent's own artefacts are excluded, so this
+        field answers "what code did this iteration change?" and nothing else.
+        """
+        cmd = ["git", "diff", "--unified=3", "--"]
+        cmd += [f":(exclude){p}" for p in self.DIFF_EXCLUDES]
         try:
-            out = subprocess.run(["git", "diff", "--unified=3"], capture_output=True,
-                                 text=True, encoding="utf-8", errors="replace", timeout=20)
+            out = subprocess.run(cmd, capture_output=True, text=True,
+                                 encoding="utf-8", errors="replace", timeout=20)
             diff = out.stdout or ""
         except Exception as exc:
             return f"(diff unavailable: {exc})"
@@ -78,85 +101,103 @@ class RunLogger:
 
     @staticmethod
     def _infer_checkpoint(command: str) -> Optional[str]:
-        toks = command.split()
-        model = loss = None
-        for i, t in enumerate(toks):
-            if t == "--model" and i + 1 < len(toks):
-                model = toks[i + 1]
-            if t == "--loss" and i + 1 < len(toks):
-                loss = toks[i + 1]
+        """Deterministic checkpoint name for a trial command.
+
+        Handles both `--model x` and `--model=x`; argparse accepts either, so a
+        parser that only understood one form would fail to locate the winning
+        checkpoint at submission time.
+        """
+        from agents.context import parse_flags
+        flags = parse_flags(command)
+        model = flags.get("model")
         if model is None:
             return None
         if model in ("fm", "mmoe", "lgb"):
             return model
-        return f"{model}_{loss or 'listwise'}"
+        return f"{model}_{flags.get('loss', 'listwise')}"
 
     # -- writing -----------------------------------------------------------
 
+    def _append_md(self, text: str):
+        """Append to both the canonical log and this run's archived copy."""
+        for path in (self.md_path, self.archive_md):
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(text)
+
+    def _write_json(self, blob: dict):
+        for path in (self.json_path, self.archive_json):
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(blob, f, indent=2)
+
+    @staticmethod
+    def _render_iteration(entry: IterationLogEntry) -> str:
+        out = [f"### Iteration {entry.iteration_id} — {entry.stage} (`{entry.status}`)\n\n",
+               f"**Hypothesis.** {entry.hypothesis}\n\n"]
+        if entry.rationale:
+            out.append(f"**Rationale.** {entry.rationale}\n\n")
+        out.append(f"- Proposal source: `{entry.proposal_source}`\n")
+        out.append(f"- Target file: `{entry.target_file}`\n")
+        out.append(f"- Command: `{entry.command}`\n")
+        if entry.metrics:
+            m = entry.metrics
+            out.append(f"- **Validation**: GAUC {m.get('gauc', 0):.4f} | "
+                       f"nDCG@5 {m.get('ndcg_5', 0):.4f} | "
+                       f"primary {m.get('primary_score', 0):.4f} "
+                       f"(delta {m.get('delta_from_baseline', 0):+.4f})\n")
+        else:
+            out.append("- **Validation**: none — the trial produced no metrics\n")
+        cum = entry.cumulative_prompt_tokens + entry.cumulative_completion_tokens
+        out.append(f"- Wall clock: {entry.wall_clock_seconds:.1f}s\n")
+        out.append(f"- Tokens this iteration: {entry.iteration_tokens:,d} "
+                   f"({entry.prompt_tokens:,d} in + {entry.completion_tokens:,d} out, "
+                   f"{entry.llm_calls} call{'s' if entry.llm_calls != 1 else ''}) "
+                   f"| cumulative: {cum:,d}\n")
+        if entry.error_recovery:
+            r = entry.error_recovery
+            out.append(f"\n**Error / recovery.** Failure classified as "
+                       f"`{r.get('failure_kind')}`; recovered: {r.get('recovered')}.\n")
+            for a in r.get("attempts", []):
+                out.append(f"  - `{a.get('strategy')}` — {a.get('detail')}\n")
+        if entry.code_diff and not entry.code_diff.startswith("(no working-tree"):
+            out.append(f"\n<details><summary>Code diff</summary>\n\n"
+                       f"```diff\n{entry.code_diff}\n```\n\n</details>\n")
+        out.append("\n---\n\n")
+        return "".join(out)
+
     def log_iteration(self, entry: IterationLogEntry):
-        record = entry.model_dump()
-        self.entries.append(record)
+        self.entries.append(entry.model_dump())
         ckpt = self._infer_checkpoint(entry.command)
         if ckpt:
             self._checkpoints[entry.iteration_id] = ckpt
 
-        with open(self.json_path, "w", encoding="utf-8") as f:
-            json.dump({"run_id": self.run_id, "total_iterations": len(self.entries),
-                       "iterations": self.entries}, f, indent=2)
-
-        with open(self.md_path, "a", encoding="utf-8") as f:
-            f.write(f"### Iteration {entry.iteration_id} — {entry.stage} "
-                    f"(`{entry.status}`)\n\n")
-            f.write(f"**Hypothesis.** {entry.hypothesis}\n\n")
-            if entry.rationale:
-                f.write(f"**Rationale.** {entry.rationale}\n\n")
-            f.write(f"- Proposal source: `{entry.proposal_source}`\n")
-            f.write(f"- Target file: `{entry.target_file}`\n")
-            f.write(f"- Command: `{entry.command}`\n")
-            if entry.metrics:
-                m = entry.metrics
-                f.write(f"- **Validation**: GAUC {m.get('gauc', 0):.4f} | "
-                        f"nDCG@5 {m.get('ndcg_5', 0):.4f} | "
-                        f"primary {m.get('primary_score', 0):.4f} "
-                        f"(delta {m.get('delta_from_baseline', 0):+.4f})\n")
-            else:
-                f.write("- **Validation**: none — the trial produced no metrics\n")
-            f.write(f"- Wall clock: {entry.wall_clock_seconds:.1f}s | "
-                    f"cumulative tokens: {entry.prompt_tokens + entry.completion_tokens:,d}\n")
-            if entry.error_recovery:
-                r = entry.error_recovery
-                f.write(f"\n**Error / recovery.** Failure classified as "
-                        f"`{r.get('failure_kind')}`; "
-                        f"recovered: {r.get('recovered')}.\n")
-                for a in r.get("attempts", []):
-                    f.write(f"  - `{a.get('strategy')}` — {a.get('detail')}\n")
-            if entry.code_diff and not entry.code_diff.startswith("(no working-tree"):
-                f.write(f"\n<details><summary>Code diff</summary>\n\n"
-                        f"```diff\n{entry.code_diff}\n```\n\n</details>\n")
-            f.write("\n---\n\n")
+        self._write_json({"run_id": self.run_id,
+                          "total_iterations": len(self.entries),
+                          "iterations": self.entries})
+        self._append_md(self._render_iteration(entry))
 
     def write_summary(self, summary: RunSummary):
         payload = summary.model_dump()
         payload["iterations"] = self.entries
         payload["total_tokens"] = summary.total_tokens
-        with open(self.json_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2)
+        self._write_json(payload)
 
-        with open(self.md_path, "a", encoding="utf-8") as f:
-            f.write("## Run summary\n\n")
-            f.write("| | |\n|---|---|\n")
-            f.write(f"| Halt reason | {summary.halt_reason} |\n")
-            best = (f"{summary.best_valid_primary:.4f}"
-                    if summary.best_valid_primary is not None else "n/a")
-            delta = (f"{summary.best_delta:+.4f}"
-                     if summary.best_delta is not None else "n/a")
-            f.write(f"| Best validation primary | {best} (iteration {summary.best_iteration}) |\n")
-            f.write(f"| Delta over official baseline | {delta} |\n")
-            f.write(f"| Iterations used | {summary.iterations_used} / {summary.iteration_cap} |\n")
-            f.write(f"| Agent wall clock | {summary.wall_clock_seconds/60:.1f} min |\n")
-            f.write(f"| LLM tokens (in + out) | {summary.total_tokens:,d} "
-                    f"in {summary.llm_calls} calls |\n")
-            f.write(f"| Error recoveries | {summary.error_recoveries} |\n")
-            f.write(f"| Failed iterations | {summary.failed_iterations} |\n")
-            f.write(f"| Manual interventions | {summary.manual_interventions} |\n")
-            f.write(f"| Submission | `{summary.submission_path or 'not produced'}` |\n")
+        best = (f"{summary.best_valid_primary:.4f}"
+                if summary.best_valid_primary is not None else "n/a")
+        delta = (f"{summary.best_delta:+.4f}"
+                 if summary.best_delta is not None else "n/a")
+        rows = [
+            ("Halt reason", summary.halt_reason),
+            ("Best validation primary", f"{best} (iteration {summary.best_iteration})"),
+            ("Delta over official baseline", delta),
+            ("Iterations used", f"{summary.iterations_used} / {summary.iteration_cap}"),
+            ("Agent wall clock", f"{summary.wall_clock_seconds/60:.1f} min"),
+            ("LLM tokens (in + out)", f"{summary.total_tokens:,d} in {summary.llm_calls} calls"),
+            ("Error recoveries", summary.error_recoveries),
+            ("Failed iterations", summary.failed_iterations),
+            ("Manual interventions", summary.manual_interventions),
+            ("Submission", f"`{summary.submission_path or 'not produced'}`"),
+        ]
+        md = ["## Run summary\n\n", "| | |\n|---|---|\n"]
+        md += [f"| {k} | {v} |\n" for k, v in rows]
+        md.append(f"\n> Archived copy of this run: `{self.archive_json}`\n")
+        self._append_md("".join(md))

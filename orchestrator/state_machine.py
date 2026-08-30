@@ -22,6 +22,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
+from agents.context import ResearchContext
+from agents.team import AgentTeam
 from orchestrator.schemas import (ExecutionResult, HypothesisProposal,
                                   IterationLogEntry, RunSummary, TokenUsage)
 from orchestrator.tree_manager import BASELINE_VAL_PRIMARY, TreeManager
@@ -147,7 +149,7 @@ class RankAgentOrchestrator:
     def __init__(self, data_dir: Optional[str] = None,
                  max_iterations: Optional[int] = None,
                  max_wall_clock: Optional[int] = None, run_id: Optional[str] = None,
-                 run_baseline: bool = False):
+                 run_baseline: bool = True):
         load_dotenv_if_present()
         agent_cfg = load_yaml("agent_config.yaml")
         bench_cfg = load_yaml("benchmark_kuairand.yaml")
@@ -155,6 +157,8 @@ class RankAgentOrchestrator:
 
         self.data_dir = data_dir
         self.run_baseline_flag = run_baseline
+        #: Whether this run actually re-ran the baseline, or merely asserted it.
+        self.baseline_reproduced = False
         # Explicit arguments win over the YAML defaults; YAML wins over the
         # hard-coded fallback. The previous order let the config silently
         # override a budget the operator had asked for on the command line.
@@ -180,6 +184,13 @@ class RankAgentOrchestrator:
         self.logger = RunLogger(run_id=run_id)
 
         self.tokens = TokenUsage()
+        self.team = AgentTeam(self.tokens, data_dir=data_dir,
+                              pm_refresh=int(agent_cfg.get("agent", {}).get("pm_refresh", 3)),
+                              proposals=int(agent_cfg.get("agent", {}).get("proposals_per_call", 3)),
+                              max_retries=int(dbg_cfg.get("max_self_healing_attempts", 3)))
+        self.ctx = ResearchContext(baseline=BASELINE_VAL_PRIMARY,
+                                   max_iterations=self.max_iterations,
+                                   wall_clock_budget_s=float(self.max_wall_clock))
         self.manual_interventions = 0
         self.error_recoveries = 0
         self.failed_iterations = 0
@@ -210,6 +221,8 @@ class RankAgentOrchestrator:
                   f"drift {drift:+.4f})")
             if drift > 0.005:
                 print(f"[WARN] baseline drift exceeds 0.005 — investigate before trusting deltas")
+            self.baseline_reproduced = True
+            self.ctx.baseline = m.primary_score
             self.tree.record_baseline(m.primary_score, node_id=0)
             self.logger.log_iteration(IterationLogEntry(
                 iteration_id=0, node_id=0, parent_node_id=None,
@@ -354,12 +367,45 @@ class RankAgentOrchestrator:
     def run_iteration(self, iteration_id: int) -> bool:
         """Execute one hypothesis. Returns whether the run should halt."""
         print(f"\n{'=' * 74}\n>>> ITERATION {iteration_id}/{self.max_iterations}\n{'=' * 74}")
-        proposal = self.propose(iteration_id)
-        command = self._with_data_dir(proposal.command)
-        self._used_commands.add(proposal.command)
 
-        print(f"  Stage      : {proposal.stage}  [{proposal.source}]")
-        print(f"  Hypothesis : {proposal.hypothesis}")
+        # Snapshot the meters so this iteration's entry records what THIS
+        # iteration spent. Reading the running totals here instead logged the
+        # cumulative figure in a per-iteration field, which made a 1.5k-token
+        # iteration look like a 5.7k-token one. Differencing also captures the
+        # repair calls the debugger makes later in this same iteration.
+        tokens_before = (self.tokens.prompt_tokens, self.tokens.completion_tokens,
+                         self.tokens.calls)
+
+        self.ctx.iteration = iteration_id
+        plan = self.team.plan(self.ctx)
+
+        if not plan.ok:
+            # The team could not produce a runnable, non-duplicate experiment.
+            # That is a real outcome worth logging, not a crash — and it must not
+            # count toward convergence, or a stuck planner would look converged.
+            print("  [SKIPPED] no runnable experiment this iteration")
+            self.failed_iterations += 1
+            self.logger.log_iteration(IterationLogEntry(
+                iteration_id=iteration_id, node_id=iteration_id,
+                parent_node_id=self.tree.select_parent(),
+                stage="Planning", hypothesis="No runnable experiment could be produced.",
+                rationale="; ".join(plan.trace), target_file="-",
+                command="(none)", proposal_source="fallback",
+                status="FAILED", metrics=None, agent_trace=plan.as_log(),
+                prompt_tokens=self.tokens.prompt_tokens - tokens_before[0],
+                completion_tokens=self.tokens.completion_tokens - tokens_before[1],
+                llm_calls=self.tokens.calls - tokens_before[2],
+                cumulative_prompt_tokens=self.tokens.prompt_tokens,
+                cumulative_completion_tokens=self.tokens.completion_tokens))
+            return self.tree.add_node(iteration_id, self.tree.select_parent(),
+                                      "no runnable experiment", "-", None)
+
+        spec = plan.spec
+        command = spec.command
+        self._used_commands.add(spec.args)
+
+        print(f"  Dimension  : {spec.dimension}")
+        print(f"  Hypothesis : {spec.hypothesis}")
         print(f"  Command    : {command}")
 
         res = self.runner.run_command(command)
@@ -367,9 +413,9 @@ class RankAgentOrchestrator:
         status = "REJECTED"
 
         if res.failed:
-            print(f"  [FAILURE:{res.status}] invoking the self-healing debugger")
-            outcome = self.debugger.attempt_repair(
-                command, res.error_traceback or "", self.runner.run_command)
+            print(f"  [FAILURE:{res.status}] handing to QA")
+            outcome = self.team.recover(command, res.error_traceback or "",
+                                        self.runner.run_command)
             recovery = outcome.as_log()
             if outcome.repaired:
                 self.error_recoveries += 1
@@ -386,24 +432,42 @@ class RankAgentOrchestrator:
             print(f"  [RESULT] valid GAUC {metrics.gauc:.4f} | nDCG@5 {metrics.ndcg_5:.4f} | "
                   f"primary {metrics.primary_score:.4f} (delta {metrics.delta_from_baseline:+.4f})")
 
+        # QA judges whether the number is believable before it is allowed to
+        # become the new best. A score below the random floor or above the oracle
+        # ceiling means the harness broke, not that the model improved.
+        verdict = self.team.review(metrics.primary_score if metrics else None)
+        trusted = metrics if (metrics and verdict.trustworthy) else None
+        if metrics and not verdict.trustworthy:
+            status = "REJECTED"
+
         parent = self.tree.select_parent()
-        converged = self.tree.add_node(iteration_id, parent, proposal.hypothesis,
-                                       proposal.target_file, metrics)
-        if metrics is not None and status != "ERROR_RECOVERED":
+        converged = self.tree.add_node(iteration_id, parent, spec.hypothesis,
+                                       "pipeline/train.py", trusted)
+        if trusted is not None and status != "ERROR_RECOVERED":
             status = self.tree.nodes[iteration_id]["status"]
         elif metrics is None:
             status = "FAILED"
 
+        self.team.record(self.ctx, iteration_id, spec,
+                         trusted.primary_score if trusted else None, status,
+                         error_kind=(recovery or {}).get("failure_kind"))
+
+        trace = plan.as_log()
+        trace["qa_verdict"] = verdict.model_dump()
         self.logger.log_iteration(IterationLogEntry(
             iteration_id=iteration_id, node_id=iteration_id, parent_node_id=parent,
-            stage=proposal.stage, hypothesis=proposal.hypothesis,
-            rationale=proposal.rationale, target_file=proposal.target_file,
-            command=command, proposal_source=proposal.source,
+            stage=spec.dimension, hypothesis=spec.hypothesis,
+            rationale=spec.mechanism, target_file="pipeline/train.py",
+            command=command, proposal_source=spec.source,
             code_diff=self.logger.capture_diff(),
             status=status, metrics=metrics.model_dump() if metrics else None,
             delta_over_baseline=metrics.delta_from_baseline if metrics else None,
-            error_recovery=recovery,
-            prompt_tokens=self.tokens.prompt_tokens, completion_tokens=self.tokens.completion_tokens,
+            error_recovery=recovery, agent_trace=trace,
+            prompt_tokens=self.tokens.prompt_tokens - tokens_before[0],
+            completion_tokens=self.tokens.completion_tokens - tokens_before[1],
+            llm_calls=self.tokens.calls - tokens_before[2],
+            cumulative_prompt_tokens=self.tokens.prompt_tokens,
+            cumulative_completion_tokens=self.tokens.completion_tokens,
             wall_clock_seconds=res.wall_clock_seconds,
             manual_interventions=0))
         print(f"  [STATUS] {status}")
@@ -447,8 +511,25 @@ class RankAgentOrchestrator:
                 self._write_summary(t0, "baseline reproduction failed", None)
                 return
         else:
-            print(f"[BASELINE] Initialized with published benchmark valid primary: {BASELINE_VAL_PRIMARY:.4f}")
+            # Development shortcut: skip the ~90s reproduction run and seed the
+            # tree with the published constant. Every delta is then measured
+            # against a number that was typed in rather than verified, so the log
+            # must say so — a reader cannot otherwise tell the two runs apart.
+            print(f"[BASELINE] ASSERTED from the published value "
+                  f"({BASELINE_VAL_PRIMARY:.4f}) — not reproduced in this run.")
+            print("[BASELINE] Deltas below are relative to an unverified reference. "
+                  "Drop --skip-baseline for a submittable run.")
+            self.baseline_reproduced = False
             self.tree.record_baseline(BASELINE_VAL_PRIMARY, node_id=0)
+            self.logger.log_iteration(IterationLogEntry(
+                iteration_id=0, node_id=0, parent_node_id=None,
+                stage="Baseline (asserted, not reproduced)",
+                hypothesis="Seed the search with the organizer's published validation "
+                           "primary of 0.6016 without re-running it.",
+                rationale="--skip-baseline was set; this run did not verify the harness.",
+                target_file="pipeline/train.py", command="(not executed)",
+                proposal_source="fallback", status="ACCEPTED",
+                metrics=None, delta_over_baseline=0.0, wall_clock_seconds=0.0))
 
         halt_reason = f"reached the {self.max_iterations}-iteration cap"
         for it in range(1, self.max_iterations + 1):
@@ -493,16 +574,22 @@ class RankAgentOrchestrator:
             error_recoveries=self.error_recoveries,
             failed_iterations=self.failed_iterations,
             submission_path=submission,
+            baseline_reproduced=self.baseline_reproduced,
+            cost_by_agent=self.team.cost_by_agent,
         )
         self.logger.write_summary(summary)
         print("\n" + "=" * 74)
         print(f"[FINISHED] {halt_reason}")
+        print(f"  baseline           : {'reproduced this run' if self.baseline_reproduced else 'ASSERTED (not reproduced)'}")
         if self.tree.has_result():
             print(f"  best valid primary : {self.tree.best_primary_score:.4f} "
                   f"(delta {self.tree.best_delta:+.4f} vs {BASELINE_VAL_PRIMARY})")
         print(f"  iterations         : {summary.iterations_used}/{self.max_iterations}")
         print(f"  wall clock         : {elapsed/60:.1f} min")
         print(f"  LLM tokens         : {summary.total_tokens:,d} in {self.tokens.calls} calls")
+        for role, c in sorted(self.team.cost_by_agent.items()):
+            print(f"    {role:<16s}: {c['prompt'] + c['completion']:>7,d} tokens "
+                  f"in {c['calls']} call{'s' if c['calls'] != 1 else ''}")
         print(f"  recoveries/failures: {self.error_recoveries}/{self.failed_iterations}")
         print(f"  manual intervention: {self.manual_interventions}")
         print(f"  submission         : {submission or 'not produced'}")
