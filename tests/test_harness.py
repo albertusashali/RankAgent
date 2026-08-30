@@ -137,8 +137,63 @@ def test_target_encoding_is_causal_on_train():
 def test_dense_features_have_no_pure_user_side_leftovers():
     """Ranking is within-user, so the feature set must carry user x item crosses."""
     _dense, names = extract_dense_tabular_features(_synthetic())
-    for cross in ('user_author_affinity', 'user_durbucket_affinity', 'user_tab_affinity'):
+    for cross in ('user_author_affinity', 'user_durbucket_affinity', 'user_tab_affinity', 'user_author_loyalty'):
         assert cross in names
+
+
+def test_short_video_dynamic_features_present():
+    """All domain dynamic features must be present in the tabular feature matrix."""
+    _dense, names = extract_dense_tabular_features(_synthetic())
+    required_dynamic_features = [
+        'video_click_longview_gap', 'video_click_to_longview_ratio', 'author_click_longview_gap',
+        'dur_norm_completion_score', 'user_author_recent_streak', 'author_recency_gap',
+        'user_session_depth'
+    ]
+    for feat in required_dynamic_features:
+        assert feat in names, f"Missing short-video dynamic feature: {feat}"
+
+
+def test_author_fatigue_and_session_depth_causality():
+    """Consecutive impressions of the same author must increment fatigue streak causally."""
+    rows = [
+        {'date': 20220408, 'user_id': 'u1', 'video_id': 'v1', 'author_id': 'a1', 'tab': '1',
+         'duration_ms': 10000.0, 'play_time_ms': 8000.0, 'label': 1, 'click': 1},
+        {'date': 20220408, 'user_id': 'u1', 'video_id': 'v2', 'author_id': 'a1', 'tab': '1',
+         'duration_ms': 10000.0, 'play_time_ms': 2000.0, 'label': 0, 'click': 1},
+        {'date': 20220408, 'user_id': 'u1', 'video_id': 'v3', 'author_id': 'a2', 'tab': '1',
+         'duration_ms': 10000.0, 'play_time_ms': 8000.0, 'label': 1, 'click': 1},
+    ]
+    splits = {'train': rows, 'valid': []}
+    dense, names = extract_dense_tabular_features(splits)
+    X, _y, _u = dense['train']
+    streak_idx = names.index('user_author_recent_streak')
+    depth_idx = names.index('user_session_depth')
+
+    # Row 0: first impression -> streak 0, depth log(1 + 0) = 0
+    assert X[0, streak_idx] == 0.0
+    assert X[0, depth_idx] == 0.0
+
+    # Row 1: second impression, same author 'a1' -> streak 1, depth log(1 + 1)
+    assert X[1, streak_idx] == 1.0
+    assert X[1, depth_idx] == pytest.approx(np.log1p(1.0))
+
+    # Row 2: third impression, different author 'a2' -> streak 0, depth log(1 + 2)
+    assert X[2, streak_idx] == 0.0
+    assert X[2, depth_idx] == pytest.approx(np.log1p(2.0))
+
+
+def test_dense_features_ignore_eval_labels():
+    """Flipping evaluation labels must have zero effect on valid-split dense features."""
+    splits = _synthetic()
+    before, _ = extract_dense_tabular_features(splits)
+    X_before = before['valid'][0]
+
+    flipped = {'train': splits['train'],
+               'valid': [dict(r, label=1 - r['label'], click=1 - r['click']) for r in splits['valid']]}
+    after, _ = extract_dense_tabular_features(flipped)
+    X_after = after['valid'][0]
+
+    assert np.allclose(X_before, X_after), "evaluation labels or feedback leaked into validation features"
 
 
 # --- convergence -----------------------------------------------------------
@@ -219,3 +274,33 @@ def test_parser_reads_the_last_eval_line():
     m = parse_execution_output(out)
     assert m.primary_score == pytest.approx(0.6015)
     assert parse_execution_output("nothing here") is None
+
+
+# --- EDA and Granular Train CLI --------------------------------------------
+
+def test_eda_report_generation(tmp_path):
+    from pipeline.eda import run_eda
+    out_file = str(tmp_path / "test_eda_report.md")
+    report = run_eda(output_path=out_file)
+    assert os.path.exists(out_file)
+    assert "GAUC Pair Distribution" in report
+    assert "NEVER CLIP OR DROP POWER USERS" in report
+    assert "Duration Bias" in report
+    assert "Auxiliary Task Correlations" in report
+
+
+def test_train_parser_arguments():
+    from pipeline.train import build_parser
+    parser = build_parser()
+    args = parser.parse_args([
+        '--model', 'mmoe',
+        '--weight_click', '0.05',
+        '--weight_like', '0.8',
+        '--weight_forward', '0.5',
+        '--drop_features', 'feat_a,feat_b'
+    ])
+    assert args.weight_click == 0.05
+    assert args.weight_like == 0.8
+    assert args.weight_forward == 0.5
+    assert args.drop_features == 'feat_a,feat_b'
+

@@ -271,6 +271,8 @@ def train_mmoe(splits: Dict, embed_dim: int = 16, num_experts: int = 4,
                expert_dim: int = 64, lr: float = 0.001, epochs: int = 20,
                bs: int = 8192, patience: int = 3, seed: int = 0,
                loss: str = 'listwise', aux_weight: float = 0.3,
+               weight_click: Optional[float] = None, weight_like: Optional[float] = None,
+               weight_forward: Optional[float] = None,
                use_cwm: bool = False, verbose: bool = True) -> TrainResult:
     """Joint long_view + auxiliary feedback training.
 
@@ -291,6 +293,12 @@ def train_mmoe(splits: Dict, embed_dim: int = 16, num_experts: int = 4,
     aux_tr = {t: np.asarray([r[t] for r in splits['train']], dtype=np.float32)
               for t in AUX_TASKS}
 
+    task_weights = {
+        'click': weight_click if weight_click is not None else aux_weight,
+        'like': weight_like if weight_like is not None else aux_weight,
+        'forward': weight_forward if weight_forward is not None else aux_weight,
+    }
+
     model = MMoE(encoder.total_dim, len(encoder.field_names), embed_dim=embed_dim,
                  num_experts=num_experts, expert_dim=expert_dim,
                  num_tasks=1 + len(AUX_TASKS)).to(DEVICE)
@@ -303,7 +311,8 @@ def train_mmoe(splits: Dict, embed_dim: int = 16, num_experts: int = 4,
 
     best, best_state, bad = -1.0, None, 0
     if verbose:
-        print(f"==> mmoe | loss={loss} | experts={num_experts} | dim={embed_dim} | {DEVICE}")
+        w_str = f"weights(clk={task_weights['click']}, lk={task_weights['like']}, fwd={task_weights['forward']})"
+        print(f"==> mmoe | loss={loss} | experts={num_experts} | dim={embed_dim} | {w_str} | {DEVICE}")
 
     for ep in range(1, epochs + 1):
         t0 = time.time()
@@ -325,7 +334,8 @@ def train_mmoe(splits: Dict, embed_dim: int = 16, num_experts: int = 4,
             total = main_loss(outs[0], yb, gb, n_groups)
             for j, task in enumerate(AUX_TASKS, start=1):
                 tb = torch.from_numpy(aux_tr[task][rows_idx]).float().to(DEVICE)
-                total = total + aux_weight * bce(outs[j], tb)
+                w = task_weights.get(task, aux_weight)
+                total = total + w * bce(outs[j], tb)
             total.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             opt.step()
@@ -351,7 +361,8 @@ def train_mmoe(splits: Dict, embed_dim: int = 16, num_experts: int = 4,
     return _finish("mmoe", evaluate(uva, yva, _predict_torch(model.to(DEVICE), Xva)),
                    {"model": "mmoe", "loss": loss, "embed_dim": embed_dim,
                     "num_experts": num_experts, "expert_dim": expert_dim,
-                    "aux_weight": aux_weight, "lr": lr, "seed": seed, "use_cwm": use_cwm})
+                    "aux_weight": aux_weight, "task_weights": task_weights,
+                    "lr": lr, "seed": seed, "use_cwm": use_cwm})
 
 
 # ---------------------------------------------------------------------------
@@ -360,6 +371,7 @@ def train_mmoe(splits: Dict, embed_dim: int = 16, num_experts: int = 4,
 
 def train_lightgbm(splits: Dict, num_trees: int = 400, lr: float = 0.05,
                    num_leaves: int = 63, seed: int = 0,
+                   drop_features: Optional[str] = None,
                    objective: str = 'lambdarank', verbose: bool = True) -> TrainResult:
     """GBDT on the causal dense features.
 
@@ -370,8 +382,15 @@ def train_lightgbm(splits: Dict, num_trees: int = 400, lr: float = 0.05,
     import lightgbm as lgb
 
     dense, names = extract_dense_tabular_features(splits)
-    Xtr, ytr, utr = dense['train']
-    Xva, yva, uva = dense['valid']
+    if drop_features:
+        drop_set = set(f.strip() for f in drop_features.split(','))
+        keep_idx = [i for i, n in enumerate(names) if n not in drop_set]
+        names = [names[i] for i in keep_idx]
+        Xtr, ytr, utr = dense['train'][0][:, keep_idx], dense['train'][1], dense['train'][2]
+        Xva, yva, uva = dense['valid'][0][:, keep_idx], dense['valid'][1], dense['valid'][2]
+    else:
+        Xtr, ytr, utr = dense['train']
+        Xva, yva, uva = dense['valid']
 
     # lambdarank needs contiguous groups, so sort each split by user.
     def regroup(X, y, users):
@@ -415,11 +434,18 @@ def train_lightgbm(splits: Dict, num_trees: int = 400, lr: float = 0.05,
         print(f"==> lightgbm[{objective}] {time.time()-t0:.1f}s, "
               f"best iteration {booster.best_iteration}")
 
+    importances = booster.feature_importance(importance_type='gain')
+    top_idx = np.argsort(importances)[::-1][:5]
+    top_feats = [f"{names[i]}:{importances[i]:.1f}" for i in top_idx if importances[i] > 0]
+    if top_feats and verbose:
+        print(f"  [TOP FEATURES] {', '.join(top_feats)}")
+
     booster.save_model(os.path.join(CHECKPOINTS_DIR, "lgb.txt"))
     va_preds = booster.predict(Xva_s, num_iteration=booster.best_iteration)
     return _finish("lgb", evaluate(uva_s, yva_s, va_preds),
                    {"model": "lgb", "objective": objective, "num_trees": num_trees,
-                    "lr": lr, "num_leaves": num_leaves, "seed": seed})
+                    "lr": lr, "num_leaves": num_leaves, "seed": seed,
+                    "drop_features": drop_features})
 
 
 # ---------------------------------------------------------------------------
@@ -438,6 +464,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--experts', type=int, default=4)
     p.add_argument('--expert_dim', type=int, default=64)
     p.add_argument('--aux_weight', type=float, default=0.3)
+    p.add_argument('--weight_click', type=float, default=None)
+    p.add_argument('--weight_like', type=float, default=None)
+    p.add_argument('--weight_forward', type=float, default=None)
+    p.add_argument('--drop_features', type=str, default=None, help='comma-separated list of feature names to drop')
     p.add_argument('--lr', type=float, default=None, help='defaults per model')
     p.add_argument('--epochs', type=int, default=20)
     p.add_argument('--batch_size', type=int, default=8192)
@@ -466,10 +496,12 @@ def main(argv=None) -> TrainResult:
                           expert_dim=args.expert_dim, lr=args.lr or 0.001,
                           epochs=args.epochs, bs=args.batch_size, patience=args.patience,
                           seed=args.seed, loss=args.loss, aux_weight=args.aux_weight,
-                          use_cwm=args.cwm)
+                          weight_click=args.weight_click, weight_like=args.weight_like,
+                          weight_forward=args.weight_forward, use_cwm=args.cwm)
     if args.model == 'lgb':
         return train_lightgbm(splits, num_trees=args.trees, lr=args.lr or 0.05,
                               num_leaves=args.num_leaves, seed=args.seed,
+                              drop_features=args.drop_features,
                               objective=args.objective)
     return train_torch(splits, arch=args.model, loss=args.loss, embed_dim=args.embed_dim,
                        lr=args.lr or 0.001, epochs=args.epochs, bs=args.batch_size,

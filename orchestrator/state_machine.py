@@ -77,20 +77,20 @@ STRATEGY_BANK: List[Dict[str, str]] = [
      "target_file": "pipeline/models.py",
      "command": f"{PY} -m pipeline.train --model fm_torch --loss listwise --epochs 15"},
 
-    {"stage": "Multi-Task Learning",
-     "hypothesis": "Train long_view jointly with click, like and forward through an MMoE. The "
-                   "auxiliary signals are logged on every impression and should regularise the "
-                   "shared embedding without diluting the scored head, which keeps its own gate.",
-     "target_file": "pipeline/train.py",
-     "command": f"{PY} -m pipeline.train --model mmoe --loss listwise --experts 4 --epochs 12"},
-
-    {"stage": "Tree-based Ranker",
-     "hypothesis": "Fit LightGBM with the lambdarank objective truncated at 5 over causal "
-                   "engagement statistics. A GBDT exploits dense count features that an "
-                   "embedding model handles poorly, giving an ensemble member with "
-                   "decorrelated errors.",
+    {"stage": "Feature Engineering (Short-Video Dynamics)",
+     "hypothesis": "Fit LightGBM LambdaMART truncated at 5 over short-video dynamic features "
+                   "(author fatigue streak, clickbait gap, duration-normalized completion, session depth). "
+                   "A GBDT learns non-linear decision splits directly penalizing consecutive repeated "
+                   "authors and deceptive clickbait while rewarding true satisfaction.",
      "target_file": "pipeline/train.py",
      "command": f"{PY} -m pipeline.train --model lgb --objective lambdarank --trees 400"},
+
+    {"stage": "Multi-Task Learning (Granular Task Balancing)",
+     "hypothesis": "Train MMoE with task weights calibrated from empirical EDA correlations: "
+                   "down-weight deceptive click noise (--weight_click 0.05) and up-weight high-quality "
+                   "signals (--weight_like 0.8, --weight_forward 0.5) to regularize the shared trunk.",
+     "target_file": "pipeline/train.py",
+     "command": f"{PY} -m pipeline.train --model mmoe --loss listwise --experts 4 --weight_click 0.05 --weight_like 0.8 --weight_forward 0.5 --epochs 12"},
 
     {"stage": "Sequential Modelling",
      "hypothesis": "Add target attention over the user's last 10 impressions (DIN). Nothing in "
@@ -98,6 +98,13 @@ STRATEGY_BANK: List[Dict[str, str]] = [
                    "candidate video should separate durable taste from incidental exposure.",
      "target_file": "pipeline/models.py",
      "command": f"{PY} -m pipeline.train --model din --loss listwise --max_seq_len 10 --epochs 10"},
+
+    {"stage": "Feature Selection / Ablation",
+     "hypothesis": "Fit LightGBM LambdaMART while dropping redundant static features "
+                   "(--drop_features author_recency_gap) to concentrate gradient budget on high-impact "
+                   "creator loyalty, clickbait gap, and duration-normalized completion metrics.",
+     "target_file": "pipeline/train.py",
+     "command": f"{PY} -m pipeline.train --model lgb --objective lambdarank --drop_features author_recency_gap --trees 400"},
 
     {"stage": "Loss Function",
      "hypothesis": "Compare a pairwise BPR objective against the listwise one. BPR optimises "
@@ -113,19 +120,18 @@ STRATEGY_BANK: List[Dict[str, str]] = [
      "target_file": "pipeline/models.py",
      "command": f"{PY} -m pipeline.train --model deepfm --loss listwise --epochs 12"},
 
+    {"stage": "Feature Engineering (Short-Video Dynamics)",
+     "hypothesis": "Deepen the GBDT ranker (num_leaves=127, lr=0.03) to capture high-order "
+                   "interactions between creator loyalty, duration bias normalization, and topic fatigue.",
+     "target_file": "pipeline/train.py",
+     "command": f"{PY} -m pipeline.train --model lgb --objective lambdarank --num_leaves 127 --lr 0.03 --trees 600"},
+
     {"stage": "Regularisation",
      "hypothesis": "Widen the MMoE expert pool while holding embedding width fixed. Capacity in "
                    "the embedding table is known not to help; capacity in the task-routing "
                    "layer is a different axis and has not been tested.",
      "target_file": "pipeline/train.py",
-     "command": f"{PY} -m pipeline.train --model mmoe --loss listwise --experts 8 --expert_dim 96 --epochs 12"},
-
-    {"stage": "Multi-Task Learning",
-     "hypothesis": "Lower the auxiliary task weight. If the rare signals are dominating the "
-                   "shared trunk rather than regularising it, a smaller weight should recover "
-                   "the scored head's accuracy.",
-     "target_file": "pipeline/train.py",
-     "command": f"{PY} -m pipeline.train --model mmoe --loss listwise --aux_weight 0.1 --epochs 12"},
+     "command": f"{PY} -m pipeline.train --model mmoe --loss listwise --experts 8 --expert_dim 96 --weight_click 0.05 --weight_like 0.8 --weight_forward 0.5 --epochs 12"},
 
     {"stage": "Hyperparameter Tuning",
      "hypothesis": "Halve the learning rate on the listwise FM and extend the epoch budget; "
@@ -133,13 +139,6 @@ STRATEGY_BANK: List[Dict[str, str]] = [
                    "is overshooting a shallow optimum.",
      "target_file": "pipeline/train.py",
      "command": f"{PY} -m pipeline.train --model fm_torch --loss listwise --lr 0.0005 --epochs 25"},
-
-    {"stage": "Tree-based Ranker",
-     "hypothesis": "Deepen the GBDT with more leaves and a lower learning rate. The causal "
-                   "features are low-dimensional, so extra depth is affordable and may capture "
-                   "interactions the embedding models get for free.",
-     "target_file": "pipeline/train.py",
-     "command": f"{PY} -m pipeline.train --model lgb --num_leaves 127 --lr 0.03 --trees 600"},
 ]
 
 
@@ -155,6 +154,8 @@ class RankAgentOrchestrator:
 
         self.data_dir = data_dir
         self.run_baseline_flag = run_baseline
+        agent_info = agent_cfg.get("agent") or {}
+        self.model_name = os.environ.get("RANKAGENT_MODEL") or agent_info.get("model") or "gpt-5.6-terra"
         # Explicit arguments win over the YAML defaults; YAML wins over the
         # hard-coded fallback. The previous order let the config silently
         # override a budget the operator had asked for on the command line.
@@ -185,6 +186,7 @@ class RankAgentOrchestrator:
         self.failed_iterations = 0
         self._used_commands: set = set()
         self._client = None
+        self.eda_summary = ""
 
     # -- data_dir threading ------------------------------------------------
 
@@ -195,6 +197,21 @@ class RankAgentOrchestrator:
         return cmd
 
     # -- phase 0 -----------------------------------------------------------
+
+    def run_eda(self) -> str:
+        """Phase 0 — Dynamic EDA profiling of KuaiRand dataset."""
+        print("=" * 74)
+        print(">>> PHASE 0 — Exploratory Data Analysis (EDA) & Data Profiling")
+        print("=" * 74)
+        report_file = os.path.join("logs", "eda_report.md")
+        if not os.path.exists(report_file):
+            from pipeline.eda import run_eda
+            self.eda_summary = run_eda(data_dir=self.data_dir, output_path=report_file)
+        else:
+            with open(report_file, encoding='utf-8') as fh:
+                self.eda_summary = fh.read()
+            print(f"==> [EDA] Loaded existing profiling report from {report_file}")
+        return self.eda_summary
 
     def run_baseline(self) -> bool:
         print("=" * 74)
@@ -276,25 +293,29 @@ class RankAgentOrchestrator:
         if client is None:
             return self._fallback_proposal(iteration_id)
 
+        if not self.eda_summary:
+            self.run_eda()
+
         prompt = HYPOTHESIS_PROMPT.format(
             iteration_id=iteration_id,
             best_score=self.tree.best_primary_score,
             delta=self.tree.best_delta,
+            eda_summary=self.eda_summary,
             history_summary=self.tree.get_history_summary(),
         )
         try:
             kind, api = client
             if kind == "anthropic":
                 resp = api.messages.create(
-                    model=os.environ.get("RANKAGENT_MODEL", "claude-sonnet-5"),
+                    model=self.model_name if "claude" in self.model_name else "claude-sonnet-5",
                     max_tokens=1200, system=SYSTEM_PROMPT,
                     messages=[{"role": "user", "content": prompt}])
                 text = "".join(b.text for b in resp.content if b.type == "text")
                 self.tokens.add(resp.usage.input_tokens, resp.usage.output_tokens)
             else:
                 resp = api.chat.completions.create(
-                    model=os.environ.get("RANKAGENT_MODEL", "gpt-4o"),
-                    response_format={"type": "json_object"}, temperature=0.3,
+                    model=self.model_name,
+                    response_format={"type": "json_object"},
                     messages=[{"role": "system", "content": SYSTEM_PROMPT},
                               {"role": "user", "content": prompt}])
                 text = resp.choices[0].message.content
@@ -313,6 +334,8 @@ class RankAgentOrchestrator:
                 target_file=str(data.get("target_file", "pipeline/train.py")),
                 command=cmd, source="llm")
         except Exception as exc:
+            import traceback
+            traceback.print_exc()
             print(f"  [WARN] LLM proposal unusable ({exc}); using the deterministic plan.")
             return self._fallback_proposal(iteration_id)
 
@@ -329,13 +352,13 @@ class RankAgentOrchestrator:
                                             error_traceback=(traceback_text or "")[-3000:])
             if api_kind == "anthropic":
                 resp = api.messages.create(
-                    model=os.environ.get("RANKAGENT_MODEL", "claude-sonnet-5"),
+                    model=self.model_name if "claude" in self.model_name else "claude-sonnet-5",
                     max_tokens=400, messages=[{"role": "user", "content": prompt}])
                 text = "".join(b.text for b in resp.content if b.type == "text")
                 self.tokens.add(resp.usage.input_tokens, resp.usage.output_tokens)
             else:
                 resp = api.chat.completions.create(
-                    model=os.environ.get("RANKAGENT_MODEL", "gpt-4o"), temperature=0.0,
+                    model=self.model_name,
                     messages=[{"role": "user", "content": prompt}])
                 text = resp.choices[0].message.content
                 self.tokens.add(resp.usage.prompt_tokens, resp.usage.completion_tokens)
@@ -440,6 +463,8 @@ class RankAgentOrchestrator:
         print(f"budget: {self.max_iterations} iterations | {self.max_wall_clock/3600:.1f}h "
               f"| convergence eps={self.epsilon} N={self.patience}")
         print("=" * 74)
+
+        self.run_eda()
 
         if self.run_baseline_flag:
             if not self.run_baseline():

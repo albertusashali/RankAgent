@@ -119,9 +119,32 @@ class TreeManager:
 
     def get_history_summary(self, max_items: int = 8) -> str:
         """Recent trials, newest last, for injection into the next prompt."""
+        lines = []
+        
+        # Calculate convergence pressure
+        history_len = len(self.best_history)
+        if history_len > 0:
+            # When the next iteration finishes, length will be history_len + 1
+            # _converged() will check: gain = best_history[-1] - best_history[-1 - n_convergence]
+            # Which corresponds to checking against index: (history_len + 1) - 1 - n_convergence = history_len - n_convergence
+            base_idx = max(0, history_len - self.n_convergence)
+            base_score = self.best_history[base_idx]
+            current_gain = self.best_history[-1] - base_score
+            needed_gain = self.epsilon - current_gain
+            
+            iterations_left = self.n_convergence - (history_len - base_idx)
+            if iterations_left <= 0:
+                iterations_left = 1 # Next iteration is the critical one that triggers the check
+                
+            if needed_gain > 0:
+                lines.append(f"[CONVERGENCE WARNING] You must improve the validation primary score by at least +{needed_gain:.4f} within the next {iterations_left} iteration(s) (compared to iteration {base_idx+1}'s best score of {base_score:.4f}), or the run will early-stop due to lack of progress.")
+            else:
+                lines.append(f"[CONVERGENCE SAFE] Convergence threshold met for the current window (gain: {current_gain:.4f} > {self.epsilon}).")
+            lines.append("")
+
         if not self.nodes:
             return "No previous iterations."
-        lines = []
+            
         for nid in sorted(self.nodes)[-max_items:]:
             n = self.nodes[nid]
             if n["primary"] is None:

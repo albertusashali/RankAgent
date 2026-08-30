@@ -142,7 +142,7 @@ class _Counter:
 
 
 class CausalStats:
-    """Expanding-window engagement statistics.
+    """Expanding-window engagement statistics and Short-Video Dynamics.
 
     ``observe(rows)`` folds a day's worth of impressions in; ``featurise(row)``
     reads the state as of everything observed so far. Encoding a split therefore
@@ -154,12 +154,26 @@ class CausalStats:
     M_CROSS = 8.0
 
     FEATURE_NAMES = [
+        # Baseline causal engagement
         'video_hist_count', 'video_hist_long_view_rate', 'video_hist_click_rate',
         'author_hist_count', 'author_hist_long_view_rate',
         'user_hist_count', 'user_hist_long_view_rate',
+
+        # User x Item crosses (affinity back-off) & Creator Loyalty
         'user_author_affinity', 'user_durbucket_affinity', 'user_tab_affinity',
+        'user_author_loyalty',
+
+        # Duration dynamics & structural debiasing
         'log_duration', 'dur_bucket', 'dur_to_user_avg_ratio',
-        'completion_ratio_prior',
+        'completion_ratio_prior', 'dur_norm_completion_score',
+
+        # Clickbait duality (instant click vs true satisfaction)
+        'video_click_longview_gap', 'video_click_to_longview_ratio',
+        'author_click_longview_gap',
+
+        # Topic fatigue & intra-day session dynamics
+        'user_author_recent_streak', 'author_recency_gap',
+        'user_session_depth',
     ]
 
     def __init__(self, dur_edges: np.ndarray, global_prior: float = 0.35):
@@ -168,6 +182,7 @@ class CausalStats:
         self.video = collections.defaultdict(_Counter)
         self.video_click = collections.defaultdict(_Counter)
         self.author = collections.defaultdict(_Counter)
+        self.author_click = collections.defaultdict(_Counter)
         self.user = collections.defaultdict(_Counter)
         self.user_author = collections.defaultdict(_Counter)
         self.user_dur = collections.defaultdict(_Counter)
@@ -177,6 +192,9 @@ class CausalStats:
         # Mean completion ratio per duration bucket — a duration-bias correction
         # that needs no label at serve time.
         self.dur_completion = collections.defaultdict(lambda: [0.0, 0.0])
+        # User exposure tracking (causal, label-free stream)
+        self.user_recent_authors = collections.defaultdict(lambda: collections.deque(maxlen=10))
+        self.user_daily_count = collections.defaultdict(int)
 
     def _bucket(self, duration_ms: float) -> int:
         return int(np.searchsorted(self.dur_edges, duration_ms))
@@ -191,6 +209,7 @@ class CausalStats:
             self.video[v].add(y)
             self.video_click[v].add(max(r.get('click', 0), 0))
             self.author[a].add(y)
+            self.author_click[a].add(max(r.get('click', 0), 0))
             self.user[u].add(y)
             self.user_author[(u, a)].add(y)
             self.user_dur[(u, b)].add(y)
@@ -205,30 +224,85 @@ class CausalStats:
     def featurise(self, row: dict) -> List[float]:
         u, v, a = row['user_id'], row['video_id'], row['author_id']
         dur = row['duration_ms']
+        d = row.get('date', 0)
         b = self._bucket(dur)
 
         vc, ac, uc = self.video[v], self.author[a], self.user[u]
+        v_click = self.video_click[v]
+        a_click = self.author_click[a]
+
+        v_long_rate = vc.rate(self.prior, self.M_ITEM)
+        v_click_rate = v_click.rate(0.15, self.M_ITEM)
+        a_long_rate = ac.rate(self.prior, self.M_ITEM)
+        a_click_rate = a_click.rate(0.15, self.M_ITEM)
         u_rate = uc.rate(self.prior, self.M_ITEM)
+
         avg_dur = (self.user_dur_sum[u] / self.user_dur_n[u]) if self.user_dur_n[u] else dur
         comp = self.dur_completion[b]
+        comp_prior = (comp[0] / comp[1]) if comp[1] else self.prior
+
+        # User x item crosses (smooth Bayesian back-off to user prior)
+        user_auth_aff = self.user_author[(u, a)].rate(u_rate, self.M_CROSS)
+        user_dur_aff = self.user_dur[(u, b)].rate(u_rate, self.M_CROSS)
+        user_tab_aff = self.user_tab[(u, row['tab'])].rate(u_rate, self.M_CROSS)
+
+        # Creator loyalty: user's completion rate on this creator vs baseline
+        user_auth_loyalty = user_auth_aff / (u_rate + 0.05)
+
+        # Duration-normalized completion expectation
+        dur_norm_comp = v_long_rate / (comp_prior + 1e-4)
+
+        # Clickbait duality metrics (gap and ratio)
+        clickbait_gap = v_click_rate - v_long_rate
+        clickbait_ratio = v_click_rate / (v_long_rate + 0.05)
+        author_clickbait_gap = a_click_rate - a_long_rate
+
+        # Topic fatigue: recent consecutive author streak and position recency gap
+        recent_authors = list(self.user_recent_authors[u])
+        author_streak = 0.0
+        for past_a in reversed(recent_authors):
+            if past_a == a:
+                author_streak += 1.0
+            else:
+                break
+
+        author_recency = 10.0
+        for step, past_a in enumerate(reversed(recent_authors), start=1):
+            if past_a == a:
+                author_recency = float(step)
+                break
+
+        # Intra-day session depth
+        daily_key = (d, u)
+        session_depth = np.log1p(self.user_daily_count[daily_key])
+
+        # Update streaming exposure buffers causally (no label consulted)
+        self.user_recent_authors[u].append(a)
+        self.user_daily_count[daily_key] += 1
 
         return [
             np.log1p(vc.imp),
-            vc.rate(self.prior, self.M_ITEM),
-            self.video_click[v].rate(0.15, self.M_ITEM),
+            v_long_rate,
+            v_click_rate,
             np.log1p(ac.imp),
-            ac.rate(self.prior, self.M_ITEM),
+            a_long_rate,
             np.log1p(uc.imp),
             u_rate,
-            # Crosses back off to the user's own rate when unseen, so a cold pair
-            # is neutral rather than pulled toward the global prior.
-            self.user_author[(u, a)].rate(u_rate, self.M_CROSS),
-            self.user_dur[(u, b)].rate(u_rate, self.M_CROSS),
-            self.user_tab[(u, row['tab'])].rate(u_rate, self.M_CROSS),
+            user_auth_aff,
+            user_dur_aff,
+            user_tab_aff,
+            user_auth_loyalty,
             np.log1p(dur),
             float(b),
             float(dur / (avg_dur + 1.0)),
-            (comp[0] / comp[1]) if comp[1] else 0.0,
+            comp_prior,
+            dur_norm_comp,
+            clickbait_gap,
+            clickbait_ratio,
+            author_clickbait_gap,
+            author_streak,
+            author_recency,
+            session_depth,
         ]
 
 

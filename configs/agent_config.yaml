@@ -2,7 +2,7 @@
 
 agent:
   name: "RankAgent"
-  model: "gpt-4o" # or "claude-3-5-sonnet", "gemini-1.5-pro"
+  model: "gpt-5.6-terra"
   temperature: 0.2
   search_algorithm: "agentic_tree_search"
   max_tree_depth: 10
