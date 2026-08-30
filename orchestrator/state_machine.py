@@ -355,19 +355,23 @@ class RankAgentOrchestrator:
     def run_iteration(self, iteration_id: int) -> bool:
         """Execute one hypothesis. Returns whether the run should halt."""
         print(f"\n{'=' * 74}\n>>> ITERATION {iteration_id}/{self.max_iterations}\n{'=' * 74}")
+        try:
+            for proposal_create in range(MAX_PROPOSAL_ATTEMPTS):
+                proposal = self.propose(iteration_id)
+                command = self._with_data_dir(proposal.command)
+                self._used_commands.add(proposal.command)
 
-        for proposal_create in range(MAX_PROPOSAL_ATTEMPTS):
-            proposal = self.propose(iteration_id)
-            command = self._with_data_dir(proposal.command)
-            self._used_commands.add(proposal.command)
+                print(f"  Stage      : {proposal.stage}  [{proposal.source}]")
+                print(f"  Hypothesis : {proposal.hypothesis}")
+                print(f"  Command    : {command}")
 
-            print(f"  Stage      : {proposal.stage}  [{proposal.source}]")
-            print(f"  Hypothesis : {proposal.hypothesis}")
-            print(f"  Command    : {command}")
-
-            if proposal.hypothesis not in self.logger.hypotheses:
-                self.logger.log_hypothesis(proposal.hypothesis)
-                break
+                if proposal.hypothesis not in self.logger.hypotheses:
+                    self.logger.log_hypothesis(proposal.hypothesis)
+                    break
+                print(f"  [WARN] hypothesis already logged; retrying ({proposal_create + 1}/{MAX_PROPOSAL_ATTEMPTS})")
+        except Exception as exc:
+            print(f"  [ERROR] failed to propose iteration {iteration_id}: {exc}")
+            return False
 
         res = self.runner.run_command(command)
         recovery: Optional[dict] = None

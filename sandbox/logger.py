@@ -63,7 +63,10 @@ class RunLogger:
     # -- hypotheses --------------------------------------------------------
     
     def log_hypothesis(self, hypothesis: str):
-        self.hypotheses.append(hypothesis)
+        try:
+            self.hypotheses.append(hypothesis)
+        except Exception as exc:
+            print(f"Failed to log hypothesis: {exc}")
 
 
     # -- checkpoints -------------------------------------------------------
