@@ -34,6 +34,7 @@ class RunLogger:
         self.entries: List[Dict] = []
         #: iteration id -> checkpoint name, so the submission step can find the winner.
         self._checkpoints: Dict[int, str] = {}
+        self.hypotheses: List[str] = []
         self._init_md()
 
     def _init_md(self):
@@ -57,6 +58,13 @@ class RunLogger:
         if not diff.strip():
             return "(no working-tree changes; trial varied configuration only)"
         return diff[:max_chars] + ("\n… truncated …" if len(diff) > max_chars else "")
+
+
+    # -- hypotheses --------------------------------------------------------
+    
+    def log_hypothesis(self, hypothesis: str):
+        self.hypotheses.append(hypothesis)
+
 
     # -- checkpoints -------------------------------------------------------
 
