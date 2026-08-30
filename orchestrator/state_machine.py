@@ -69,13 +69,30 @@ def load_yaml(name: str) -> Dict[str, Any]:
 # behaviour sequence — leads.
 
 STRATEGY_BANK: List[Dict[str, str]] = [
-    {"stage": "Loss Function",
-     "hypothesis": "Replace pointwise BCE with a within-user listwise softmax. The metrics "
-                   "(GAUC, nDCG@5) rank inside a user's impression list, so a per-impression "
-                   "likelihood optimises the wrong quantity; a listwise objective is invariant "
-                   "to per-user score offsets exactly as the metrics are.",
+    {"stage": "Architecture | Multi-Task Learning (Regularized Dense PLE)",
+     "hypothesis": "Train a Progressive Layered Extraction (PLE) model with weight_decay=1e-4 and cosine learning rate schedule, "
+                   "fusing collaborative ID embeddings and continuous causal short-video dynamics. "
+                   "L2 regularization prevents sparse tail ID memorization and eliminates the post-epoch-3 overfitting cliff.",
      "target_file": "pipeline/models.py",
-     "command": f"{PY} -m pipeline.train --model fm_torch --loss listwise --epochs 15"},
+     "command": f"{PY} -m pipeline.train --model ple --loss listwise --dense --weight_decay 1e-4 --private_experts 1 --shared_experts 2 --expert_dim 64 --weight_click 0.05 --weight_like 0.8 --weight_forward 0.5 --epochs 12"},
+
+    {"stage": "Loss Function | Multi-Task BPR Margin Ranking",
+     "hypothesis": "Train PLE under a within-user pairwise BPR objective for task 0 (long_view) with auxiliary BCE multi-task regularizers. "
+                   "Pairwise margin optimization prevents logit magnification on unbiased random-exposure impression lists.",
+     "target_file": "pipeline/train.py",
+     "command": f"{PY} -m pipeline.train --model ple --loss bpr --dense --weight_decay 1e-4 --private_experts 1 --shared_experts 2 --expert_dim 64 --weight_click 0.05 --weight_like 0.8 --weight_forward 0.5 --epochs 12"},
+
+    {"stage": "Architecture | Explicit Feature Crossing (Regularized DCN-v2)",
+     "hypothesis": "Train a Deep & Cross Network v2 (DCN-v2) with weight_decay=1e-4 fusing ID embeddings and continuous causal features. "
+                   "Explicit polynomial crosses ($x_u \\times x_i$) break the static user feature cancellation trap.",
+     "target_file": "pipeline/models.py",
+     "command": f"{PY} -m pipeline.train --model dcn_v2 --loss listwise --dense --weight_decay 1e-4 --embed_dim 16 --epochs 12"},
+
+    {"stage": "Sequential Modelling (Regularized BST)",
+     "hypothesis": "Train a Behavior Sequence Transformer (BST) with multi-head self-attention over historical views "
+                   "and fused continuous session depth and fatigue signals with weight_decay=1e-4.",
+     "target_file": "pipeline/models.py",
+     "command": f"{PY} -m pipeline.train --model bst --loss listwise --dense --weight_decay 1e-4 --max_seq_len 10 --embed_dim 16 --epochs 12"},
 
     {"stage": "Feature Engineering (Short-Video Dynamics)",
      "hypothesis": "Fit LightGBM LambdaMART truncated at 5 over short-video dynamic features "
@@ -86,59 +103,26 @@ STRATEGY_BANK: List[Dict[str, str]] = [
      "command": f"{PY} -m pipeline.train --model lgb --objective lambdarank --trees 400"},
 
     {"stage": "Multi-Task Learning (Granular Task Balancing)",
-     "hypothesis": "Train MMoE with task weights calibrated from empirical EDA correlations: "
+     "hypothesis": "Train MMoE with continuous dense causal features, weight_decay=1e-4, and task weights calibrated from EDA: "
                    "down-weight deceptive click noise (--weight_click 0.05) and up-weight high-quality "
-                   "signals (--weight_like 0.8, --weight_forward 0.5) to regularize the shared trunk.",
+                   "signals (--weight_like 0.8, --weight_forward 0.5).",
      "target_file": "pipeline/train.py",
-     "command": f"{PY} -m pipeline.train --model mmoe --loss listwise --experts 4 --weight_click 0.05 --weight_like 0.8 --weight_forward 0.5 --epochs 12"},
+     "command": f"{PY} -m pipeline.train --model mmoe --loss listwise --dense --weight_decay 1e-4 --experts 4 --weight_click 0.05 --weight_like 0.8 --weight_forward 0.5 --epochs 12"},
 
     {"stage": "Sequential Modelling",
-     "hypothesis": "Add target attention over the user's last 10 impressions (DIN). Nothing in "
-                   "the baseline uses behaviour order, and attention conditioned on the "
-                   "candidate video should separate durable taste from incidental exposure.",
+     "hypothesis": "Add target attention over the user's last 10 impressions (DIN) with continuous dense features and weight_decay=1e-4.",
      "target_file": "pipeline/models.py",
-     "command": f"{PY} -m pipeline.train --model din --loss listwise --max_seq_len 10 --epochs 10"},
-
-    {"stage": "Feature Selection / Ablation",
-     "hypothesis": "Fit LightGBM LambdaMART while dropping redundant static features "
-                   "(--drop_features author_recency_gap) to concentrate gradient budget on high-impact "
-                   "creator loyalty, clickbait gap, and duration-normalized completion metrics.",
-     "target_file": "pipeline/train.py",
-     "command": f"{PY} -m pipeline.train --model lgb --objective lambdarank --drop_features author_recency_gap --trees 400"},
+     "command": f"{PY} -m pipeline.train --model din --loss listwise --dense --weight_decay 1e-4 --max_seq_len 10 --epochs 10"},
 
     {"stage": "Loss Function",
-     "hypothesis": "Compare a pairwise BPR objective against the listwise one. BPR optimises "
-                   "the pairwise ordering AUC counts directly, so if GAUC matters more than "
-                   "top-heavy nDCG it should win.",
+     "hypothesis": "Train DCN-v2 with dense continuous features under a pairwise BPR objective with weight_decay=1e-4.",
      "target_file": "pipeline/models.py",
-     "command": f"{PY} -m pipeline.train --model fm_torch --loss bpr --epochs 15"},
+     "command": f"{PY} -m pipeline.train --model dcn_v2 --loss bpr --dense --weight_decay 1e-4 --embed_dim 16 --epochs 12"},
 
-    {"stage": "Architecture",
-     "hypothesis": "Add an MLP branch over the field embeddings (DeepFM) under the listwise "
-                   "loss, testing whether implicit higher-order crosses add anything over the "
-                   "second-order FM term at this data scale.",
+    {"stage": "Architecture | Multi-Task Learning",
+     "hypothesis": "Scale PLE shared expert capacity (shared_experts=4, expert_dim=96) with dense features and weight_decay=1e-4.",
      "target_file": "pipeline/models.py",
-     "command": f"{PY} -m pipeline.train --model deepfm --loss listwise --epochs 12"},
-
-    {"stage": "Feature Engineering (Short-Video Dynamics)",
-     "hypothesis": "Deepen the GBDT ranker (num_leaves=127, lr=0.03) to capture high-order "
-                   "interactions between creator loyalty, duration bias normalization, and topic fatigue.",
-     "target_file": "pipeline/train.py",
-     "command": f"{PY} -m pipeline.train --model lgb --objective lambdarank --num_leaves 127 --lr 0.03 --trees 600"},
-
-    {"stage": "Regularisation",
-     "hypothesis": "Widen the MMoE expert pool while holding embedding width fixed. Capacity in "
-                   "the embedding table is known not to help; capacity in the task-routing "
-                   "layer is a different axis and has not been tested.",
-     "target_file": "pipeline/train.py",
-     "command": f"{PY} -m pipeline.train --model mmoe --loss listwise --experts 8 --expert_dim 96 --weight_click 0.05 --weight_like 0.8 --weight_forward 0.5 --epochs 12"},
-
-    {"stage": "Hyperparameter Tuning",
-     "hypothesis": "Halve the learning rate on the listwise FM and extend the epoch budget; "
-                   "the listwise objective converged in 8 epochs, which suggests the step size "
-                   "is overshooting a shallow optimum.",
-     "target_file": "pipeline/train.py",
-     "command": f"{PY} -m pipeline.train --model fm_torch --loss listwise --lr 0.0005 --epochs 25"},
+     "command": f"{PY} -m pipeline.train --model ple --loss listwise --dense --weight_decay 1e-4 --private_experts 1 --shared_experts 4 --expert_dim 96 --weight_click 0.05 --weight_like 0.8 --weight_forward 0.5 --epochs 12"},
 ]
 
 

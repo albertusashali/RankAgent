@@ -293,14 +293,75 @@ def test_train_parser_arguments():
     from pipeline.train import build_parser
     parser = build_parser()
     args = parser.parse_args([
-        '--model', 'mmoe',
+        '--model', 'ple',
+        '--private_experts', '2',
+        '--shared_experts', '3',
         '--weight_click', '0.05',
         '--weight_like', '0.8',
         '--weight_forward', '0.5',
+        '--dense',
+        '--weight_decay', '0.0003',
         '--drop_features', 'feat_a,feat_b'
     ])
+    assert args.model == 'ple'
+    assert args.private_experts == 2
+    assert args.shared_experts == 3
     assert args.weight_click == 0.05
     assert args.weight_like == 0.8
     assert args.weight_forward == 0.5
+    assert args.dense is True
+    assert args.weight_decay == 0.0003
     assert args.drop_features == 'feat_a,feat_b'
+
+    args_bst = parser.parse_args(['--model', 'bst', '--max_seq_len', '15', '--dense'])
+    assert args_bst.model == 'bst'
+    assert args_bst.max_seq_len == 15
+    assert args_bst.dense is True
+    assert args_bst.weight_decay == 1e-4
+
+    args_dcn = parser.parse_args(['--model', 'dcn_v2', '--embed_dim', '32', '--dense'])
+    assert args_dcn.model == 'dcn_v2'
+    assert args_dcn.embed_dim == 32
+    assert args_dcn.dense is True
+
+
+def test_new_models_forward_backward():
+    import torch
+    from pipeline.models import PLE, DCNv2, BST
+
+    batch_size = 16
+    num_fields = 5
+    dense_dim = 12
+    embed_dim = 8
+    num_features = 100
+    pad_id = 99
+    max_seq_len = 10
+
+    x_cat = torch.randint(0, num_features, (batch_size, num_fields))
+    x_dense = torch.randn(batch_size, dense_dim)
+
+    # 1. DCNv2 (with and without dense)
+    dcn = DCNv2(num_features, num_fields, embed_dim=embed_dim, dense_dim=dense_dim, num_cross_layers=2)
+    out_dcn = dcn(x_cat, x_dense=x_dense)
+    assert out_dcn.shape == (batch_size,)
+    out_dcn.sum().backward()
+
+    # 2. PLE (with and without dense)
+    ple = PLE(num_features, num_fields, embed_dim=embed_dim, dense_dim=dense_dim,
+              num_private_experts=1, num_shared_experts=2, expert_dim=32, num_tasks=4)
+    outs_ple = ple(x_cat, x_dense=x_dense)
+    assert len(outs_ple) == 4
+    for o in outs_ple:
+        assert o.shape == (batch_size,)
+    sum(outs_ple).sum().backward()
+
+    # 3. BST (with and without dense)
+    bst = BST(num_features, num_fields, pad_id=pad_id, embed_dim=embed_dim,
+              dense_dim=dense_dim, num_heads=2, num_layers=1, max_seq_len=max_seq_len)
+    x_hist = torch.randint(0, num_features, (batch_size, max_seq_len))
+    out_bst = bst(x_cat, x_hist, x_dense=x_dense)
+    assert out_bst.shape == (batch_size,)
+    out_bst.sum().backward()
+
+
 

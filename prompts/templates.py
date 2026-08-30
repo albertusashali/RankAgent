@@ -14,25 +14,29 @@ Reference points (validation split):
 {RECSYS_KB}
 
 Trainer interface — `python -m pipeline.train`:
-  --model          fm | fm_torch | deepfm | din | mmoe | lgb
-  --loss           pointwise | listwise | bpr        (ignored by fm and lgb)
-  --embed_dim      16 | 32 | 64
-  --experts        4 | 6 | 8          (mmoe)
-  --expert_dim     64 | 96 | 128      (mmoe)
-  --aux_weight     0.1 | 0.3 | 0.5    (mmoe global auxiliary task weight)
-  --weight_click   0.05 | 0.1 | 0.2   (mmoe granular click task weight)
-  --weight_like    0.3 | 0.5 | 0.8    (mmoe granular like task weight)
-  --weight_forward 0.3 | 0.5 | 0.8    (mmoe granular forward task weight)
-  --drop_features  comma-separated feature names to ablate (lgb)
-  --lr             0.0003 | 0.0005 | 0.001 | 0.003
-  --epochs         8 | 12 | 15 | 25
-  --batch_size     4096 | 8192 | 16384
-  --trees          200 | 400 | 600    (lgb)
-  --num_leaves     31 | 63 | 127      (lgb)
-  --objective      lambdarank | binary (lgb)
-  --max_seq_len    5 | 10 | 20        (din)
-  --cwm            adds music_id / video_type / upload_type fields
-  --seed           integer
+  --model            fm | fm_torch | deepfm | dcn_v2 | din | bst | mmoe | ple | lgb
+  --loss             pointwise | listwise | bpr        (ignored by fm and lgb)
+  --embed_dim        16 | 32
+  --dense            fuse continuous causal features (fatigue streaks, loyalty, clickbait gap, duration completion)
+  --weight_decay     1e-4 | 3e-4 | 1e-3 (regularization against tail ID overfitting)
+  --private_experts  1 | 2              (ple: private experts per task)
+  --shared_experts   2 | 4              (ple: shared expert pool)
+  --experts          4 | 6 | 8          (mmoe)
+  --expert_dim       64 | 96            (mmoe / ple)
+  --aux_weight       0.1 | 0.3 | 0.5    (mmoe / ple global auxiliary task weight)
+  --weight_click     0.05 | 0.1 | 0.2   (mmoe / ple granular click task weight)
+  --weight_like      0.3 | 0.5 | 0.8    (mmoe / ple granular like task weight)
+  --weight_forward   0.3 | 0.5 | 0.8    (mmoe / ple granular forward task weight)
+  --drop_features    comma-separated feature names to ablate (lgb)
+  --lr               0.0003 | 0.0005 | 0.001 | 0.003
+  --epochs           8 | 12 | 15 | 20
+  --batch_size       4096 | 8192 | 16384
+  --trees            200 | 400 | 600    (lgb)
+  --num_leaves       31 | 63 | 127      (lgb)
+  --objective        lambdarank | binary (lgb)
+  --max_seq_len      5 | 10 | 20        (din / bst)
+  --cwm              adds music_id / video_type / upload_type fields
+  --seed             integer
 
 Rules:
 1. Propose ONE concrete, grounded hypothesis, and give the exact command that tests it.

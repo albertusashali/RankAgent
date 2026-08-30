@@ -107,7 +107,7 @@ def _grouped_batches(groups: List[np.ndarray], rng: np.random.Generator,
 # ---------------------------------------------------------------------------
 
 def _predict_torch(model, X: np.ndarray, hist: Optional[np.ndarray] = None,
-                   bs: int = 65536) -> np.ndarray:
+                   dense: Optional[np.ndarray] = None, bs: int = 65536) -> np.ndarray:
     import torch
     from pipeline.models import DEVICE
     model.eval()
@@ -115,11 +115,12 @@ def _predict_torch(model, X: np.ndarray, hist: Optional[np.ndarray] = None,
     with torch.no_grad():
         for i in range(0, len(X), bs):
             xb = torch.from_numpy(X[i:i + bs]).long().to(DEVICE)
+            db = torch.from_numpy(dense[i:i + bs]).float().to(DEVICE) if dense is not None else None
             if hist is not None:
                 hb = torch.from_numpy(hist[i:i + bs]).long().to(DEVICE)
-                out.append(model(xb, hb).cpu().numpy())
+                out.append(model(xb, hb, x_dense=db).cpu().numpy())
             else:
-                res = model(xb)
+                res = model(xb, x_dense=db) if hasattr(model, 'dense_dim') else model(xb)
                 out.append((res[0] if isinstance(res, tuple) else res).cpu().numpy())
     return np.concatenate(out).astype(np.float64)
 
@@ -165,18 +166,18 @@ def train_numpy_fm(splits: Dict, k: int = 16, lr: float = 0.001, epochs: int = 4
 
 
 # ---------------------------------------------------------------------------
-# 2. Torch single-task models (FM / DeepFM / DIN) with swappable loss
+# 2. Torch single-task models (FM / DeepFM / DIN / DCNv2 / BST) with swappable loss
 # ---------------------------------------------------------------------------
 
 def train_torch(splits: Dict, arch: str = 'fm_torch', loss: str = 'listwise',
                 embed_dim: int = 16, lr: float = 0.001, epochs: int = 20,
                 bs: int = 8192, patience: int = 3, seed: int = 0,
-                use_cwm: bool = False, weight_decay: float = 1e-6,
+                use_cwm: bool = False, use_dense: bool = False, weight_decay: float = 1e-4,
                 max_seq_len: int = 10, verbose: bool = True) -> TrainResult:
     """Train an embedding model under a pointwise, pairwise or listwise objective."""
     import torch
     import torch.nn as nn
-    from pipeline.models import DEVICE, LOSSES, DIN, DeepFM, TorchFM
+    from pipeline.models import DEVICE, LOSSES, BST, DCNv2, DIN, DeepFM, TorchFM
 
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -186,21 +187,34 @@ def train_torch(splits: Dict, arch: str = 'fm_torch', loss: str = 'listwise',
     Xva, yva, uva = enc['valid']
     n_fields = len(encoder.field_names)
 
-    needs_hist = (arch == 'din')
+    if use_dense:
+        dense_data, _ = extract_dense_tabular_features(splits)
+        Dtr, Dva = dense_data['train'][0], dense_data['valid'][0]
+        dense_dim = Dtr.shape[1]
+    else:
+        Dtr = Dva = None
+        dense_dim = 0
+
+    needs_hist = (arch in ('din', 'bst'))
     if needs_hist:
         seqs = extract_sequential_features(splits, encoder, max_seq_len=max_seq_len)
         Htr, Hva = seqs['train'], seqs['valid']
     else:
         Htr = Hva = None
 
-    # DIN indexes the reserved padding row, so its table is one row longer.
+    # Sequential models index the reserved padding row, so their tables are one row longer.
     rows = encoder.embedding_rows if needs_hist else encoder.total_dim
     if arch == 'fm_torch':
         model = TorchFM(rows, n_fields, embed_dim)
     elif arch == 'deepfm':
-        model = DeepFM(rows, n_fields, embed_dim)
+        model = DeepFM(rows, n_fields, embed_dim=embed_dim, dense_dim=dense_dim)
+    elif arch == 'dcn_v2':
+        model = DCNv2(rows, n_fields, embed_dim=embed_dim, dense_dim=dense_dim)
     elif arch == 'din':
-        model = DIN(rows, n_fields, pad_id=encoder.pad_id, embed_dim=embed_dim)
+        model = DIN(rows, n_fields, pad_id=encoder.pad_id, embed_dim=embed_dim, dense_dim=dense_dim)
+    elif arch == 'bst':
+        model = BST(rows, n_fields, pad_id=encoder.pad_id, embed_dim=embed_dim,
+                    dense_dim=dense_dim, max_seq_len=max_seq_len)
     else:
         raise ValueError(f"unknown arch {arch!r}")
     model = model.to(DEVICE)
@@ -208,12 +222,14 @@ def train_torch(splits: Dict, arch: str = 'fm_torch', loss: str = 'listwise',
     loss_fn = LOSSES[loss]
     grouped = loss in ('listwise', 'bpr')
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=1e-5)
     rng = np.random.default_rng(seed)
     groups = _user_groups(utr) if grouped else None
 
     best, best_state, bad = -1.0, None, 0
     if verbose:
-        print(f"==> {arch} | loss={loss} | dim={embed_dim} | fields={n_fields} | {DEVICE}")
+        dense_str = f"dense={dense_dim}" if use_dense else "dense=0"
+        print(f"==> {arch} | loss={loss} | dim={embed_dim} | {dense_str} | wd={weight_decay} | fields={n_fields} | {DEVICE}")
 
     for ep in range(1, epochs + 1):
         t0 = time.time()
@@ -230,8 +246,12 @@ def train_torch(splits: Dict, arch: str = 'fm_torch', loss: str = 'listwise',
             xb = torch.from_numpy(Xtr[rows_idx]).long().to(DEVICE)
             yb = torch.from_numpy(ytr[rows_idx]).float().to(DEVICE)
             gb = torch.from_numpy(gids).long().to(DEVICE) if gids is not None else None
-            logits = model(xb, torch.from_numpy(Htr[rows_idx]).long().to(DEVICE)) \
-                if needs_hist else model(xb)
+            db = torch.from_numpy(Dtr[rows_idx]).float().to(DEVICE) if use_dense else None
+
+            if needs_hist:
+                logits = model(xb, torch.from_numpy(Htr[rows_idx]).long().to(DEVICE), x_dense=db)
+            else:
+                logits = model(xb, x_dense=db) if hasattr(model, 'dense_dim') else model(xb)
 
             opt.zero_grad()
             l = loss_fn(logits, yb, gb, n_groups)
@@ -240,7 +260,8 @@ def train_torch(splits: Dict, arch: str = 'fm_torch', loss: str = 'listwise',
             opt.step()
             losses.append(l.item())
 
-        va = evaluate(uva, yva, _predict_torch(model, Xva, Hva))
+        scheduler.step()
+        va = evaluate(uva, yva, _predict_torch(model, Xva, Hva, dense=Dva))
         if verbose:
             print(f"  epoch {ep:2d} | loss {np.mean(losses):.4f} | valid GAUC {va['GAUC']:.4f} "
                   f"nDCG@5 {va['nDCG@5']:.4f} primary {va['primary']:.4f} | {time.time()-t0:.1f}s")
@@ -258,9 +279,11 @@ def train_torch(splits: Dict, arch: str = 'fm_torch', loss: str = 'listwise',
     model.load_state_dict(best_state)
     name = f"{arch}_{loss}"
     torch.save(best_state, os.path.join(CHECKPOINTS_DIR, f"{name}.pt"))
-    return _finish(name, evaluate(uva, yva, _predict_torch(model.to(DEVICE), Xva, Hva)),
+    return _finish(name, evaluate(uva, yva, _predict_torch(model.to(DEVICE), Xva, Hva, dense=Dva)),
                    {"model": arch, "loss": loss, "embed_dim": embed_dim, "lr": lr,
-                    "seed": seed, "use_cwm": use_cwm, "max_seq_len": max_seq_len})
+                    "seed": seed, "use_cwm": use_cwm, "use_dense": use_dense,
+                    "weight_decay": weight_decay, "dense_dim": dense_dim,
+                    "max_seq_len": max_seq_len})
 
 
 # ---------------------------------------------------------------------------
@@ -273,13 +296,9 @@ def train_mmoe(splits: Dict, embed_dim: int = 16, num_experts: int = 4,
                loss: str = 'listwise', aux_weight: float = 0.3,
                weight_click: Optional[float] = None, weight_like: Optional[float] = None,
                weight_forward: Optional[float] = None,
-               use_cwm: bool = False, verbose: bool = True) -> TrainResult:
-    """Joint long_view + auxiliary feedback training.
-
-    The scored head (task 0) uses the chosen ranking loss; auxiliary heads stay
-    pointwise, since their job is to regularise the shared embedding rather than
-    to be ranked.
-    """
+               use_cwm: bool = False, use_dense: bool = False,
+               weight_decay: float = 1e-4, verbose: bool = True) -> TrainResult:
+    """Joint long_view + auxiliary feedback training."""
     import torch
     import torch.nn as nn
     from pipeline.models import DEVICE, LOSSES, MMoE
@@ -293,6 +312,14 @@ def train_mmoe(splits: Dict, embed_dim: int = 16, num_experts: int = 4,
     aux_tr = {t: np.asarray([r[t] for r in splits['train']], dtype=np.float32)
               for t in AUX_TASKS}
 
+    if use_dense:
+        dense_data, _ = extract_dense_tabular_features(splits)
+        Dtr, Dva = dense_data['train'][0], dense_data['valid'][0]
+        dense_dim = Dtr.shape[1]
+    else:
+        Dtr = Dva = None
+        dense_dim = 0
+
     task_weights = {
         'click': weight_click if weight_click is not None else aux_weight,
         'like': weight_like if weight_like is not None else aux_weight,
@@ -300,9 +327,10 @@ def train_mmoe(splits: Dict, embed_dim: int = 16, num_experts: int = 4,
     }
 
     model = MMoE(encoder.total_dim, len(encoder.field_names), embed_dim=embed_dim,
-                 num_experts=num_experts, expert_dim=expert_dim,
+                 dense_dim=dense_dim, num_experts=num_experts, expert_dim=expert_dim,
                  num_tasks=1 + len(AUX_TASKS)).to(DEVICE)
-    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-6)
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=1e-5)
     main_loss = LOSSES[loss]
     grouped = loss in ('listwise', 'bpr')
     bce = nn.BCEWithLogitsLoss()
@@ -312,7 +340,8 @@ def train_mmoe(splits: Dict, embed_dim: int = 16, num_experts: int = 4,
     best, best_state, bad = -1.0, None, 0
     if verbose:
         w_str = f"weights(clk={task_weights['click']}, lk={task_weights['like']}, fwd={task_weights['forward']})"
-        print(f"==> mmoe | loss={loss} | experts={num_experts} | dim={embed_dim} | {w_str} | {DEVICE}")
+        dense_str = f"dense={dense_dim}" if use_dense else "dense=0"
+        print(f"==> mmoe | loss={loss} | experts={num_experts} | dim={embed_dim} | {dense_str} | wd={weight_decay} | {w_str} | {DEVICE}")
 
     for ep in range(1, epochs + 1):
         t0 = time.time()
@@ -328,8 +357,9 @@ def train_mmoe(splits: Dict, embed_dim: int = 16, num_experts: int = 4,
             xb = torch.from_numpy(Xtr[rows_idx]).long().to(DEVICE)
             yb = torch.from_numpy(ytr[rows_idx]).float().to(DEVICE)
             gb = torch.from_numpy(gids).long().to(DEVICE) if gids is not None else None
+            db = torch.from_numpy(Dtr[rows_idx]).float().to(DEVICE) if use_dense else None
 
-            outs = model(xb)
+            outs = model(xb, x_dense=db)
             opt.zero_grad()
             total = main_loss(outs[0], yb, gb, n_groups)
             for j, task in enumerate(AUX_TASKS, start=1):
@@ -341,7 +371,8 @@ def train_mmoe(splits: Dict, embed_dim: int = 16, num_experts: int = 4,
             opt.step()
             losses.append(total.item())
 
-        va = evaluate(uva, yva, _predict_torch(model, Xva))
+        scheduler.step()
+        va = evaluate(uva, yva, _predict_torch(model, Xva, dense=Dva))
         if verbose:
             print(f"  epoch {ep:2d} | loss {np.mean(losses):.4f} | valid GAUC {va['GAUC']:.4f} "
                   f"nDCG@5 {va['nDCG@5']:.4f} primary {va['primary']:.4f} | {time.time()-t0:.1f}s")
@@ -358,11 +389,129 @@ def train_mmoe(splits: Dict, embed_dim: int = 16, num_experts: int = 4,
 
     model.load_state_dict(best_state)
     torch.save(best_state, os.path.join(CHECKPOINTS_DIR, "mmoe.pt"))
-    return _finish("mmoe", evaluate(uva, yva, _predict_torch(model.to(DEVICE), Xva)),
+    return _finish("mmoe", evaluate(uva, yva, _predict_torch(model.to(DEVICE), Xva, dense=Dva)),
                    {"model": "mmoe", "loss": loss, "embed_dim": embed_dim,
                     "num_experts": num_experts, "expert_dim": expert_dim,
                     "aux_weight": aux_weight, "task_weights": task_weights,
-                    "lr": lr, "seed": seed, "use_cwm": use_cwm})
+                    "lr": lr, "seed": seed, "use_cwm": use_cwm,
+                    "use_dense": use_dense, "weight_decay": weight_decay, "dense_dim": dense_dim})
+
+
+# ---------------------------------------------------------------------------
+# 3b. Multi-task PLE (Progressive Layered Extraction)
+# ---------------------------------------------------------------------------
+
+def train_ple(splits: Dict, embed_dim: int = 16, num_private_experts: int = 1,
+              num_shared_experts: int = 2, expert_dim: int = 64, lr: float = 0.001,
+              epochs: int = 20, bs: int = 8192, patience: int = 3, seed: int = 0,
+              loss: str = 'listwise', aux_weight: float = 0.3,
+              weight_click: Optional[float] = None, weight_like: Optional[float] = None,
+              weight_forward: Optional[float] = None,
+              use_cwm: bool = False, use_dense: bool = False,
+              weight_decay: float = 1e-4, verbose: bool = True) -> TrainResult:
+    """Joint training with Customized Gate Control to avoid negative transfer."""
+    import torch
+    import torch.nn as nn
+    from pipeline.models import DEVICE, LOSSES, PLE
+
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    enc, encoder = encode_features(splits, use_cwm_fields=use_cwm)
+    Xtr, ytr, utr = enc['train']
+    Xva, yva, uva = enc['valid']
+    aux_tr = {t: np.asarray([r[t] for r in splits['train']], dtype=np.float32)
+              for t in AUX_TASKS}
+
+    if use_dense:
+        dense_data, _ = extract_dense_tabular_features(splits)
+        Dtr, Dva = dense_data['train'][0], dense_data['valid'][0]
+        dense_dim = Dtr.shape[1]
+    else:
+        Dtr = Dva = None
+        dense_dim = 0
+
+    task_weights = {
+        'click': weight_click if weight_click is not None else aux_weight,
+        'like': weight_like if weight_like is not None else aux_weight,
+        'forward': weight_forward if weight_forward is not None else aux_weight,
+    }
+
+    model = PLE(encoder.total_dim, len(encoder.field_names), embed_dim=embed_dim,
+                dense_dim=dense_dim,
+                num_private_experts=num_private_experts,
+                num_shared_experts=num_shared_experts,
+                expert_dim=expert_dim,
+                num_tasks=1 + len(AUX_TASKS)).to(DEVICE)
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=1e-5)
+    main_loss = LOSSES[loss]
+    grouped = loss in ('listwise', 'bpr')
+    bce = nn.BCEWithLogitsLoss()
+    rng = np.random.default_rng(seed)
+    groups = _user_groups(utr) if grouped else None
+
+    best, best_state, bad = -1.0, None, 0
+    if verbose:
+        w_str = f"weights(clk={task_weights['click']}, lk={task_weights['like']}, fwd={task_weights['forward']})"
+        dense_str = f"dense={dense_dim}" if use_dense else "dense=0"
+        print(f"==> ple | loss={loss} | priv={num_private_experts} shared={num_shared_experts} | dim={embed_dim} | {dense_str} | wd={weight_decay} | {w_str} | {DEVICE}")
+
+    for ep in range(1, epochs + 1):
+        t0 = time.time()
+        model.train()
+        losses = []
+        if grouped:
+            batches = _grouped_batches(groups, rng, target_rows=bs)
+        else:
+            perm = rng.permutation(len(ytr))
+            batches = ((perm[i:i + bs], None, 0) for i in range(0, len(perm), bs))
+
+        for rows_idx, gids, n_groups in batches:
+            xb = torch.from_numpy(Xtr[rows_idx]).long().to(DEVICE)
+            yb = torch.from_numpy(ytr[rows_idx]).float().to(DEVICE)
+            gb = torch.from_numpy(gids).long().to(DEVICE) if gids is not None else None
+            db = torch.from_numpy(Dtr[rows_idx]).float().to(DEVICE) if use_dense else None
+
+            outs = model(xb, x_dense=db)
+            opt.zero_grad()
+            total = main_loss(outs[0], yb, gb, n_groups)
+            for j, task in enumerate(AUX_TASKS, start=1):
+                tb = torch.from_numpy(aux_tr[task][rows_idx]).float().to(DEVICE)
+                w = task_weights.get(task, aux_weight)
+                total = total + w * bce(outs[j], tb)
+            total.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            opt.step()
+            losses.append(total.item())
+
+        scheduler.step()
+        va = evaluate(uva, yva, _predict_torch(model, Xva, dense=Dva))
+        if verbose:
+            print(f"  epoch {ep:2d} | loss {np.mean(losses):.4f} | valid GAUC {va['GAUC']:.4f} "
+                  f"nDCG@5 {va['nDCG@5']:.4f} primary {va['primary']:.4f} | {time.time()-t0:.1f}s")
+
+        if va['primary'] > best + 1e-5:
+            best, bad = va['primary'], 0
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        else:
+            bad += 1
+            if bad >= patience:
+                if verbose:
+                    print(f"  early stop at epoch {ep}")
+                break
+
+    model.load_state_dict(best_state)
+    torch.save(best_state, os.path.join(CHECKPOINTS_DIR, "ple.pt"))
+    return _finish("ple", evaluate(uva, yva, _predict_torch(model.to(DEVICE), Xva, dense=Dva)),
+                   {"model": "ple", "loss": loss, "embed_dim": embed_dim,
+                    "num_private_experts": num_private_experts,
+                    "num_shared_experts": num_shared_experts,
+                    "expert_dim": expert_dim,
+                    "aux_weight": aux_weight, "task_weights": task_weights,
+                    "lr": lr, "seed": seed, "use_cwm": use_cwm,
+                    "use_dense": use_dense, "weight_decay": weight_decay,
+                    "dense_dim": dense_dim})
 
 
 # ---------------------------------------------------------------------------
@@ -452,7 +601,7 @@ def train_lightgbm(splits: Dict, num_trees: int = 400, lr: float = 0.05,
 # CLI
 # ---------------------------------------------------------------------------
 
-ARCHS = ['fm', 'fm_torch', 'deepfm', 'din', 'mmoe', 'lgb']
+ARCHS = ['fm', 'fm_torch', 'deepfm', 'din', 'bst', 'mmoe', 'ple', 'dcn_v2', 'lgb']
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -463,11 +612,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--embed_dim', type=int, default=16)
     p.add_argument('--experts', type=int, default=4)
     p.add_argument('--expert_dim', type=int, default=64)
+    p.add_argument('--private_experts', type=int, default=1, help='private experts per task (ple)')
+    p.add_argument('--shared_experts', type=int, default=2, help='shared experts pool (ple)')
     p.add_argument('--aux_weight', type=float, default=0.3)
     p.add_argument('--weight_click', type=float, default=None)
     p.add_argument('--weight_like', type=float, default=None)
     p.add_argument('--weight_forward', type=float, default=None)
     p.add_argument('--drop_features', type=str, default=None, help='comma-separated list of feature names to drop')
+    p.add_argument('--dense', action='store_true', help='fuse continuous causal tabular features into neural models')
+    p.add_argument('--weight_decay', type=float, default=1e-4, help='L2 weight decay for optimizer (default: 1e-4)')
     p.add_argument('--lr', type=float, default=None, help='defaults per model')
     p.add_argument('--epochs', type=int, default=20)
     p.add_argument('--batch_size', type=int, default=8192)
@@ -497,7 +650,18 @@ def main(argv=None) -> TrainResult:
                           epochs=args.epochs, bs=args.batch_size, patience=args.patience,
                           seed=args.seed, loss=args.loss, aux_weight=args.aux_weight,
                           weight_click=args.weight_click, weight_like=args.weight_like,
-                          weight_forward=args.weight_forward, use_cwm=args.cwm)
+                          weight_forward=args.weight_forward, use_cwm=args.cwm,
+                          use_dense=args.dense, weight_decay=args.weight_decay)
+    if args.model == 'ple':
+        return train_ple(splits, embed_dim=args.embed_dim,
+                         num_private_experts=args.private_experts,
+                         num_shared_experts=args.shared_experts,
+                         expert_dim=args.expert_dim, lr=args.lr or 0.001,
+                         epochs=args.epochs, bs=args.batch_size, patience=args.patience,
+                         seed=args.seed, loss=args.loss, aux_weight=args.aux_weight,
+                         weight_click=args.weight_click, weight_like=args.weight_like,
+                         weight_forward=args.weight_forward, use_cwm=args.cwm,
+                         use_dense=args.dense, weight_decay=args.weight_decay)
     if args.model == 'lgb':
         return train_lightgbm(splits, num_trees=args.trees, lr=args.lr or 0.05,
                               num_leaves=args.num_leaves, seed=args.seed,
@@ -506,6 +670,7 @@ def main(argv=None) -> TrainResult:
     return train_torch(splits, arch=args.model, loss=args.loss, embed_dim=args.embed_dim,
                        lr=args.lr or 0.001, epochs=args.epochs, bs=args.batch_size,
                        patience=args.patience, seed=args.seed, use_cwm=args.cwm,
+                       use_dense=args.dense, weight_decay=args.weight_decay,
                        max_seq_len=args.max_seq_len)
 
 

@@ -37,22 +37,27 @@ RECSYS_KB = """
    - Cross-Features: User x Author affinity, User x Duration bucket affinity, User x Tab affinity back off smoothly to the user's prior rate.
    - Discrepancy & Fatigue Signals: Tabular GBDTs (LightGBM LambdaMART) excel at learning non-linear threshold cuts on clickbait gaps, author streaks, and normalized completion expectations.
 
-4. MULTI-TASK & AUXILIARY SIGNALS:
+4. MULTI-TASK & AUXILIARY SIGNALS (MMoE vs PLE):
    - KuaiRand logs auxiliary signals: `click`, `like`, `follow`, `comment`, `forward`, `play_time_ms`, `duration_ms`.
    - Multi-Task Learning (MMoE): Jointly train auxiliary heads (`click`, `like`, `forward`) to regularize shared embeddings without diluting task 0 (`long_view`).
+   - Progressive Layered Extraction (PLE / CGC): Unlike MMoE where all experts are shared, PLE equips each task with private experts alongside shared experts. This eliminates the "seesaw effect" (negative transfer) where noisy `click` gradients corrupt representations for `long_view`.
 
-5. SEQUENTIAL & ATTENTION MODELING (DIN / SASRec):
+5. SEQUENTIAL & ATTENTION MODELING (DIN vs BST):
    - Causal impression sequence captures evolving user taste over the last 5-20 impressions.
-   - Shared ID space between candidate item and history enables meaningful target attention.
+   - Deep Interest Network (DIN): Target attention queries history using candidate item.
+   - Behavior Sequence Transformer (BST): Self-attention Transformer encoder models item-to-item sequential transitions and positional dynamics across the user history before scoring the candidate.
 
-6. CRITICAL RECSYS TRAPS & HIGH-VALUE LEVERS:
+6. EXPLICIT CROSSING (DCN-v2):
+   - Deep & Cross Network v2 (DCN-v2): Applies explicit polynomial feature crossing to break the static user feature cancellation trap, learning multiplicative user x item interactions automatically without manual feature engineering.
+
+7. CRITICAL RECSYS TRAPS & HIGH-VALUE LEVERS:
    - THE TRAP: Never Drop/Clip Power Users (Outliers):
      * In standard tabular classification, users with 5,000 views look like outliers. In RecSys, clipping or dropping them is FATAL.
      * The number of informative ranking pairs for GAUC scales as O(N_pos * N_neg). The top 1% power users contribute the vast majority of all pairwise ranking pairs in the dataset. Dropping them ruins validation scores.
    - THE TRAP: Static User Features Have Zero Direct Ranking Gradient:
      * Static user features (e.g., age bracket, registration days) add a constant +C_u to every video candidate in user u's impression list.
      * In within-user ranking (GAUC / nDCG@5), (Score(u, i) - Score(u, j)) = (g(i) + C_u) - (g(j) + C_u) = g(i) - g(j). The user constant cancels out completely!
-     * Static user features are completely useless unless explicitly crossed/interacted with video or author attributes.
+     * Static user features are completely useless unless explicitly crossed/interacted with video or author attributes (use DCN-v2 or causal aggregations).
    - HIGH-VALUE LEVER: Causal Interaction Aggregations:
      * Compute smoothed expanding-window historical interaction statistics, e.g., Affinity(u, author) = (clicks(u, author) + 1) / (impressions(u, author) + 10).
    - HIGH-VALUE LEVER: Duration Log-Ratio Normalization:

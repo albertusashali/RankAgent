@@ -140,26 +140,51 @@ def predict_split(name: str, splits: Dict[str, List[dict]], split: str) -> np.nd
         return np.asarray(m.predict(X), dtype=np.float64)
 
     import torch
-    from pipeline.models import DEVICE, DIN, DeepFM, MMoE, TorchFM
+    from pipeline.models import DEVICE, BST, DCNv2, DIN, DeepFM, MMoE, PLE, TorchFM
     from pipeline.train import _predict_torch
 
     dim = meta.get("embed_dim", 16)
     n_fields = len(encoder.field_names)
     hist = None
+    use_dense = meta.get("use_dense", False)
+    dense_dim = meta.get("dense_dim", 0)
+    dense_mat = None
+
+    if use_dense:
+        dense_data, _ = extract_dense_tabular_features(splits)
+        dense_mat = dense_data[split][0]
 
     if arch == 'din':
         seqs = extract_sequential_features(splits, encoder,
                                            max_seq_len=meta.get("max_seq_len", 10))
         hist = seqs[split]
-        model = DIN(encoder.embedding_rows, n_fields, pad_id=encoder.pad_id, embed_dim=dim)
+        model = DIN(encoder.embedding_rows, n_fields, pad_id=encoder.pad_id, embed_dim=dim,
+                    dense_dim=dense_dim)
+    elif arch == 'bst':
+        seqs = extract_sequential_features(splits, encoder,
+                                           max_seq_len=meta.get("max_seq_len", 10))
+        hist = seqs[split]
+        model = BST(encoder.embedding_rows, n_fields, pad_id=encoder.pad_id, embed_dim=dim,
+                    dense_dim=dense_dim, max_seq_len=meta.get("max_seq_len", 10))
     elif arch == 'mmoe':
         from pipeline.train import AUX_TASKS
         model = MMoE(encoder.total_dim, n_fields, embed_dim=dim,
+                     dense_dim=dense_dim,
                      num_experts=meta.get("num_experts", 4),
                      expert_dim=meta.get("expert_dim", 64),
                      num_tasks=1 + len(AUX_TASKS))
+    elif arch == 'ple':
+        from pipeline.train import AUX_TASKS
+        model = PLE(encoder.total_dim, n_fields, embed_dim=dim,
+                    dense_dim=dense_dim,
+                    num_private_experts=meta.get("num_private_experts", 1),
+                    num_shared_experts=meta.get("num_shared_experts", 2),
+                    expert_dim=meta.get("expert_dim", 64),
+                    num_tasks=1 + len(AUX_TASKS))
+    elif arch == 'dcn_v2':
+        model = DCNv2(encoder.total_dim, n_fields, embed_dim=dim, dense_dim=dense_dim)
     elif arch == 'deepfm':
-        model = DeepFM(encoder.total_dim, n_fields, embed_dim=dim)
+        model = DeepFM(encoder.total_dim, n_fields, embed_dim=dim, dense_dim=dense_dim)
     elif arch == 'fm_torch':
         model = TorchFM(encoder.total_dim, n_fields, embed_dim=dim)
     else:
@@ -167,7 +192,7 @@ def predict_split(name: str, splits: Dict[str, List[dict]], split: str) -> np.nd
 
     ckpt = os.path.join(CHECKPOINTS_DIR, f"{name}.pt")
     model.load_state_dict(torch.load(ckpt, map_location='cpu'))
-    return _predict_torch(model.to(DEVICE), X, hist)
+    return _predict_torch(model.to(DEVICE), X, hist, dense=dense_mat)
 
 
 def prediction_cache_path(name: str, split: str) -> str:
@@ -206,21 +231,26 @@ def _rank_normalise(x: np.ndarray) -> np.ndarray:
 
 def blend_weight_on_valid(names: Sequence[str], splits: Dict[str, List[dict]],
                           grid: int = 21) -> tuple:
-    """Choose a two-model blend weight on validation only."""
-    if len(names) != 2:
-        raise ValueError("blending currently supports exactly two checkpoints")
+    """Choose a blend weight on validation only."""
     yva = [r['label'] for r in splits['valid']]
     uva = [r['user_id'] for r in splits['valid']]
-    a = _rank_normalise(load_cached(names[0], 'valid'))
-    b = _rank_normalise(load_cached(names[1], 'valid'))
-    best_w, best_p = 1.0, -1.0
-    for w in np.linspace(0.0, 1.0, grid):
-        p = evaluate(uva, yva, w * a + (1 - w) * b)['primary']
-        if p > best_p:
-            best_w, best_p = float(w), p
-    print(f"[BLEND] best weight {best_w:.2f} for {names[0]} vs {names[1]} "
-          f"-> valid primary {best_p:.4f}")
-    return best_w, best_p
+    if len(names) == 2:
+        a = _rank_normalise(load_cached(names[0], 'valid'))
+        b = _rank_normalise(load_cached(names[1], 'valid'))
+        best_w, best_p = 1.0, -1.0
+        for w in np.linspace(0.0, 1.0, grid):
+            p = evaluate(uva, yva, w * a + (1 - w) * b)['primary']
+            if p > best_p:
+                best_w, best_p = float(w), p
+        print(f"[BLEND] best weight {best_w:.2f} for {names[0]} vs {names[1]} "
+              f"-> valid primary {best_p:.4f}")
+        return best_w, best_p
+    else:
+        norm_preds = [_rank_normalise(load_cached(n, 'valid')) for n in names]
+        blended = np.mean(norm_preds, axis=0)
+        p = evaluate(uva, yva, blended)['primary']
+        print(f"[BLEND] equal rank average across {len(names)} models -> valid primary {p:.4f}")
+        return 1.0 / len(names), p
 
 
 # ---------------------------------------------------------------------------
@@ -235,12 +265,15 @@ def build_submission(names: Sequence[str], out_path: str, data_dir: Optional[str
 
     if len(names) == 1:
         scores = predict_split(names[0], splits, 'test')
-    else:
+    elif len(names) == 2:
         if weight is None:
             weight, _ = blend_weight_on_valid(names, splits)
         a = _rank_normalise(load_cached(names[0], 'test'))
         b = _rank_normalise(load_cached(names[1], 'test'))
         scores = weight * a + (1 - weight) * b
+    else:
+        norm_preds = [_rank_normalise(load_cached(n, 'test')) for n in names]
+        scores = np.mean(norm_preds, axis=0)
 
     path = write_submission(test_rows, scores, out_path)
     check_submission(path, test_rows)
@@ -252,7 +285,7 @@ def main(argv=None):
     p.add_argument('--data_dir', default=None)
     p.add_argument('--file', default=os.path.join(SUBMISSIONS_DIR, "kuairand_pure_final.csv"))
     p.add_argument('--checkpoint', nargs='+', default=None,
-                   help="checkpoint name(s) under checkpoints/, e.g. fm_torch_listwise")
+                   help="checkpoint name(s) under checkpoints/, e.g. ple_listwise")
     p.add_argument('--weight', type=float, default=None,
                    help="blend weight for the first checkpoint; tuned on valid if omitted")
     g = p.add_mutually_exclusive_group(required=True)
