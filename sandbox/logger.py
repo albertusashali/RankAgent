@@ -110,6 +110,10 @@ class RunLogger:
             f.write(f"**Hypothesis.** {entry.hypothesis}\n\n")
             if entry.rationale:
                 f.write(f"**Rationale.** {entry.rationale}\n\n")
+            if entry.detailed_reasoning:
+                f.write(f"**Detailed reasoning.** {entry.detailed_reasoning}\n\n")
+            if entry.postmortem_diagnosis:
+                f.write(f"**Post-mortem diagnosis.** {entry.postmortem_diagnosis}\n\n")
             f.write(f"- Proposal source: `{entry.proposal_source}`\n")
             f.write(f"- Target file: `{entry.target_file}`\n")
             f.write(f"- Command: `{entry.command}`\n")

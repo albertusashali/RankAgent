@@ -54,6 +54,8 @@ Propose the next experiment.
   "stage": "Loss Function | Architecture | Multi-Task Learning | Feature Engineering | Tree-based Ranker | Sequential Modelling | Hyperparameter Tuning",
   "hypothesis": "what you are testing and the mechanism you expect to help",
   "rationale": "why this beats what has already been tried",
+  "detailed_reasoning": "what the command is doing, key considerations, the hypothesis, and the expected interpretation of the result",
+  "postmortem_diagnosis": "for iteration > 1, explain why the previous iteration failed (rejected, errored, or timed out), using only the history; for iteration 1 use 'N/A'",
   "target_file": "pipeline/models.py or pipeline/train.py",
   "execution_command": "python -m pipeline.train --model ... --loss ..."
 }}"""
