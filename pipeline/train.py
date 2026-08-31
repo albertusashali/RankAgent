@@ -110,8 +110,10 @@ def _grouped_batches(groups: List[np.ndarray], rng: np.random.Generator,
 # Prediction helpers
 # ---------------------------------------------------------------------------
 
-def _predict_torch(model, X: np.ndarray, hist: Optional[np.ndarray] = None,
-                   bs: int = 65536) -> np.ndarray:
+def _predict_torch(model, X: np.ndarray, side: Optional[np.ndarray] = None,
+                   bs: int = 65536, side_is_long: bool = True) -> np.ndarray:
+    """Score a split. ``side`` is the model's second forward argument, if any —
+    integer history ids (``side_is_long``) or float dense features."""
     import torch
     from pipeline.models import DEVICE
     model.eval()
@@ -119,9 +121,10 @@ def _predict_torch(model, X: np.ndarray, hist: Optional[np.ndarray] = None,
     with torch.no_grad():
         for i in range(0, len(X), bs):
             xb = torch.from_numpy(X[i:i + bs]).long().to(DEVICE)
-            if hist is not None:
-                hb = torch.from_numpy(hist[i:i + bs]).long().to(DEVICE)
-                out.append(model(xb, hb).cpu().numpy())
+            if side is not None:
+                sb = torch.from_numpy(side[i:i + bs])
+                sb = (sb.long() if side_is_long else sb.float()).to(DEVICE)
+                out.append(model(xb, sb).cpu().numpy())
             else:
                 res = model(xb)
                 out.append((res[0] if isinstance(res, tuple) else res).cpu().numpy())
@@ -176,7 +179,8 @@ def train_torch(splits: Dict, arch: str = 'fm_torch', loss: str = 'listwise',
                 embed_dim: int = 16, lr: float = 0.001, epochs: int = 20,
                 bs: int = 8192, patience: int = 3, seed: int = 0,
                 use_cwm: bool = False, weight_decay: float = 1e-6,
-                max_seq_len: int = 10, verbose: bool = True) -> TrainResult:
+                max_seq_len: int = 10, verbose: bool = True,
+                feature_recipe=None) -> TrainResult:
     """Train an embedding model under a pointwise, pairwise or listwise objective."""
     import torch
     import torch.nn as nn
@@ -191,19 +195,42 @@ def train_torch(splits: Dict, arch: str = 'fm_torch', loss: str = 'listwise',
     n_fields = len(encoder.field_names)
 
     builder = resolve_model(arch)
-    # Whether a model consumes the user's impression sequence is declared on the
-    # builder, so registering an architecture is a single-site edit.
+    # Which side input a model consumes is declared on the builder, so
+    # registering an architecture stays a single-site edit.
     needs_hist = getattr(builder, 'needs_history', False)
+    needs_dense = getattr(builder, 'needs_dense', False)
+
+    Htr = Hva = Dtr = Dva = None
+    num_dense = 0
     if needs_hist:
         seqs = extract_sequential_features(splits, encoder, max_seq_len=max_seq_len)
         Htr, Hva = seqs['train'], seqs['valid']
-    else:
-        Htr = Hva = None
+    if needs_dense:
+        dense, dense_names = extract_dense_tabular_features(splits, recipe=feature_recipe)
+        Dtr, Dva = dense['train'][0], dense['valid'][0]
+        num_dense = Dtr.shape[1]
+        # encode_features and extract_dense_tabular_features both iterate the
+        # split in order, so row i means the same impression in both. Assert it
+        # rather than trust it: a mismatch would silently pair each row's
+        # embeddings with another row's history statistics.
+        if len(Dtr) != len(Xtr) or len(Dva) != len(Xva):
+            raise ValueError(
+                f"dense/categorical row mismatch: train {len(Dtr)} vs {len(Xtr)}, "
+                f"valid {len(Dva)} vs {len(Xva)}")
+        if verbose:
+            print(f"==> {num_dense} causal dense features: "
+                  f"{', '.join(dense_names[:6])}{' ...' if len(dense_names) > 6 else ''}")
 
     # A history-consuming model indexes the reserved padding row, so its table is
     # one row longer.
     rows = encoder.embedding_rows if needs_hist else encoder.total_dim
-    model = builder(rows, n_fields, embed_dim, encoder.pad_id).to(DEVICE)
+    model = builder(rows, n_fields, embed_dim, encoder.pad_id,
+                    num_dense=num_dense).to(DEVICE)
+
+    # Whichever side input this model takes, it arrives as the second forward
+    # argument. History is integer ids; dense features are floats.
+    side_tr, side_va = (Htr, Hva) if needs_hist else (Dtr, Dva)
+    side_is_long = needs_hist
 
     loss_fn = resolve_loss(loss)
     # Whether the objective is computed within a user's impression list is a
@@ -234,8 +261,12 @@ def train_torch(splits: Dict, arch: str = 'fm_torch', loss: str = 'listwise',
             xb = torch.from_numpy(Xtr[rows_idx]).long().to(DEVICE)
             yb = torch.from_numpy(ytr[rows_idx]).float().to(DEVICE)
             gb = torch.from_numpy(gids).long().to(DEVICE) if gids is not None else None
-            logits = model(xb, torch.from_numpy(Htr[rows_idx]).long().to(DEVICE)) \
-                if needs_hist else model(xb)
+            if side_tr is not None:
+                sb = torch.from_numpy(side_tr[rows_idx])
+                sb = (sb.long() if side_is_long else sb.float()).to(DEVICE)
+                logits = model(xb, sb)
+            else:
+                logits = model(xb)
 
             opt.zero_grad()
             l = loss_fn(logits, yb, gb, n_groups)
@@ -244,7 +275,7 @@ def train_torch(splits: Dict, arch: str = 'fm_torch', loss: str = 'listwise',
             opt.step()
             losses.append(l.item())
 
-        va = evaluate(uva, yva, _predict_torch(model, Xva, Hva))
+        va = evaluate(uva, yva, _predict_torch(model, Xva, side_va, side_is_long=side_is_long))
         if verbose:
             print(f"  epoch {ep:2d} | loss {np.mean(losses):.4f} | valid GAUC {va['GAUC']:.4f} "
                   f"nDCG@5 {va['nDCG@5']:.4f} primary {va['primary']:.4f} | {time.time()-t0:.1f}s")
@@ -262,9 +293,15 @@ def train_torch(splits: Dict, arch: str = 'fm_torch', loss: str = 'listwise',
     model.load_state_dict(best_state)
     name = f"{arch}_{loss}"
     torch.save(best_state, os.path.join(CHECKPOINTS_DIR, f"{name}.pt"))
-    return _finish(name, evaluate(uva, yva, _predict_torch(model.to(DEVICE), Xva, Hva)),
+    return _finish(name, evaluate(uva, yva, _predict_torch(model.to(DEVICE), Xva, side_va,
+                                                    side_is_long=side_is_long)),
                    {"model": arch, "loss": loss, "embed_dim": embed_dim, "lr": lr,
-                    "seed": seed, "use_cwm": use_cwm, "max_seq_len": max_seq_len})
+                    "seed": seed, "use_cwm": use_cwm, "max_seq_len": max_seq_len,
+                    # A dense model must be rebuilt with the SAME feature set at
+                    # inference, or its first layer is the wrong width.
+                    "num_dense": num_dense,
+                    "feature_recipe": (feature_recipe.model_dump()
+                                       if feature_recipe is not None else None)})
 
 
 # ---------------------------------------------------------------------------
@@ -364,7 +401,8 @@ def train_mmoe(splits: Dict, embed_dim: int = 16, num_experts: int = 4,
 
 def train_lightgbm(splits: Dict, num_trees: int = 400, lr: float = 0.05,
                    num_leaves: int = 63, seed: int = 0,
-                   objective: str = 'lambdarank', verbose: bool = True) -> TrainResult:
+                   objective: str = 'lambdarank', verbose: bool = True,
+                   feature_recipe=None) -> TrainResult:
     """GBDT on the causal dense features.
 
     Defaults to ``lambdarank`` with user groups and truncation at 5, so the tree
@@ -373,7 +411,7 @@ def train_lightgbm(splits: Dict, num_trees: int = 400, lr: float = 0.05,
     """
     import lightgbm as lgb
 
-    dense, names = extract_dense_tabular_features(splits)
+    dense, names = extract_dense_tabular_features(splits, recipe=feature_recipe)
     Xtr, ytr, utr = dense['train']
     Xva, yva, uva = dense['valid']
 
@@ -423,7 +461,16 @@ def train_lightgbm(splits: Dict, num_trees: int = 400, lr: float = 0.05,
     va_preds = booster.predict(Xva_s, num_iteration=booster.best_iteration)
     return _finish("lgb", evaluate(uva_s, yva_s, va_preds),
                    {"model": "lgb", "objective": objective, "num_trees": num_trees,
-                    "lr": lr, "num_leaves": num_leaves, "seed": seed})
+                    "lr": lr, "num_leaves": num_leaves, "seed": seed,
+                    # The recipe travels with the checkpoint. Inference has to
+                    # build the SAME feature matrix that training used; without
+                    # this, a model trained on a 15-feature recipe would be
+                    # scored against the default set and silently mispredict.
+                    "feature_recipe": (feature_recipe.model_dump()
+                                       if feature_recipe is not None else None),
+                    "feature_recipe_id": (feature_recipe.recipe_id
+                                          if feature_recipe is not None else None),
+                    "feature_names": names})
 
 
 # ---------------------------------------------------------------------------
@@ -466,12 +513,35 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--max_seq_len', type=int, default=10)
     p.add_argument('--cwm', action='store_true', help='add music_id/video_type/upload_type fields')
     p.add_argument('--seed', type=int, default=0)
+    p.add_argument('--feature_recipe', default=None,
+                   help='path to a FeatureRecipe JSON. A validated, content-hashed '
+                        'feature configuration — the Feature Steward\'s action '
+                        'space, which needs no code generation.')
+    p.add_argument('--feature_profile', default=None,
+                   choices=['core', 'affinity', 'full'],
+                   help='shorthand for a recipe with this base profile')
     p.add_argument('--smoke', action='store_true',
                    help='correctness check: one epoch on a small user subsample. '
                         'The reported score is NOT comparable to a full run.')
     p.add_argument('--smoke_users', type=int, default=3000,
                    help='users retained in --smoke mode (default 3000)')
     return p
+
+
+def resolve_recipe(args):
+    """Build the FeatureRecipe this run should use, or None for the default.
+
+    A recipe is the Feature Steward's action space: a validated, content-hashed
+    feature configuration that needs no code generation. It is audited before it
+    is written, so an unknown feature name or an out-of-range smoothing constant
+    is caught at compile time rather than becoming a wasted training run.
+    """
+    path = getattr(args, 'feature_recipe', None)
+    profile = getattr(args, 'feature_profile', None)
+    if path is None and profile is None:
+        return None
+    from pipeline.feature_recipes import load_recipe
+    return load_recipe(path, base_profile=profile or 'affinity')
 
 
 def subsample_for_smoke(splits: Dict[str, List[dict]], max_users: int = 3000,
@@ -531,11 +601,13 @@ def main(argv=None) -> TrainResult:
     if args.model == 'lgb':
         return train_lightgbm(splits, num_trees=trees, lr=args.lr or 0.05,
                               num_leaves=args.num_leaves, seed=args.seed,
-                              objective=args.objective)
+                              objective=args.objective,
+                              feature_recipe=resolve_recipe(args))
     return train_torch(splits, arch=args.model, loss=args.loss, embed_dim=args.embed_dim,
                        lr=args.lr or 0.001, epochs=epochs, bs=args.batch_size,
                        patience=patience, seed=args.seed, use_cwm=args.cwm,
-                       max_seq_len=args.max_seq_len)
+                       max_seq_len=args.max_seq_len,
+                       feature_recipe=resolve_recipe(args))
 
 
 if __name__ == '__main__':

@@ -24,6 +24,9 @@ In the steady state that is roughly one call per iteration, not four.
 """
 from __future__ import annotations
 
+import os
+import sys
+
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
@@ -31,10 +34,13 @@ from agents.base import LLMClient
 from agents.context import (ResearchContext, TrialRecord, command_signature,
                             parse_flags)
 from agents.engineer import EngineerAgent, TrialSpec
+from agents.feature_steward import FeatureStewardAgent
 from agents.product_manager import Directive, ProductManagerAgent
 from agents.qa import QAAgent
 from agents.researcher import Hypothesis, ResearchAgent
 from orchestrator.schemas import TokenUsage
+
+PY = sys.executable
 
 
 @dataclass
@@ -87,6 +93,10 @@ class AgentTeam:
         self.researcher = ResearchAgent(self.llm, proposals=proposals, verbose=verbose)
         self.engineer = EngineerAgent(self.llm, verbose=verbose)
         self.qa = QAAgent(self.llm, max_retries=max_retries, verbose=verbose)
+        self.steward = FeatureStewardAgent(self.llm, verbose=verbose)
+        #: recipe_id -> iteration, so a recipe is never run twice. Recipes are
+        #: content-hashed, so this is exact rather than a string comparison.
+        self.tried_recipes: Dict[str, int] = {}
 
     @property
     def llm_available(self) -> bool:
@@ -127,7 +137,29 @@ class AgentTeam:
             directive = ctx.directive
             trace.append(f"PM directive '{directive.phase}' still current")
 
-        # 2. Researcher — hypotheses.
+        # 2a. Feature Steward — owns the feature dimension.
+        #
+        # When the PM points at `features`, a recipe is the better instrument
+        # than generated code: feature engineering is where leakage happens, and
+        # a recipe cannot leak by construction because every feature it can
+        # select is already manifest-declared and mutation-tested. Generated
+        # feature code is still available — the Researcher proposes it and the
+        # Steward's audits gate it — but it is not the first thing tried.
+        if directive and "features" in (directive.focus_dimensions or []):
+            spec = self._propose_recipe(ctx, workspace, trace)
+            if spec is not None:
+                verdict = self.qa.preflight(ctx, spec, workspace=workspace)
+                if verdict.ok:
+                    self._say("    [QA]         pre-flight passed")
+                    trace.append("QA pre-flight passed")
+                    return IterationPlan(spec=spec, directive=directive,
+                                         hypotheses=[], trace=trace,
+                                         pm_refreshed=refreshed)
+                for p in verdict.problems:
+                    self._say(f"    [QA]         BLOCKED: {p}")
+                trace.extend(f"QA blocked the recipe: {p}" for p in verdict.problems)
+
+        # 2b. Researcher — hypotheses.
         hypotheses = self.researcher.run(ctx)
         self._say(f"    [RESEARCH]   {len(hypotheses)} hypothesis candidate(s) in "
                   f"{', '.join(sorted({h.dimension for h in hypotheses}))}")
@@ -193,6 +225,64 @@ class AgentTeam:
         trace.append("QA pre-flight passed")
         return IterationPlan(spec=spec, directive=directive, hypotheses=hypotheses,
                              trace=trace, pm_refreshed=refreshed)
+
+    def _propose_recipe(self, ctx: ResearchContext, workspace,
+                        trace: List[str]) -> Optional[TrialSpec]:
+        """Ask the Steward for a feature recipe and bind it to a command."""
+        if workspace is None:
+            return None
+
+        ok, why = self.steward.audit_manifest()
+        if not ok:
+            self._say(f"    [STEWARD]    manifest audit failed: {why}")
+            trace.append(f"feature manifest audit failed: {why}")
+            return None
+
+        try:
+            recipe = self.steward.run(ctx, tried_ids=list(self.tried_recipes))
+        except Exception as exc:
+            trace.append(f"feature steward produced nothing: {exc}")
+            return None
+
+        if recipe.recipe_id in self.tried_recipes:
+            self._say(f"    [STEWARD]    recipe {recipe.recipe_id} already run at "
+                      f"iteration {self.tried_recipes[recipe.recipe_id]}")
+            trace.append(f"recipe {recipe.recipe_id} is a duplicate")
+            return None
+
+        try:
+            path = self.steward.save_recipe(recipe, workspace, ctx.iteration)
+        except ValueError as exc:
+            self._say(f"    [STEWARD]    {exc}")
+            trace.append(str(exc))
+            return None
+
+        self.tried_recipes[recipe.recipe_id] = ctx.iteration
+        rationale = getattr(self.steward, "last_rationale", "")
+        self._say(f"    [STEWARD]    recipe {recipe.recipe_id} '{recipe.name}' "
+                  f"(profile={recipe.base_profile}, item_sm={recipe.item_smoothing}, "
+                  f"cross_sm={recipe.cross_smoothing})")
+        trace.append(f"feature recipe {recipe.recipe_id}: {rationale}")
+
+        # The recipe only reaches a model that consumes dense features.
+        args = (f"--model lgb --feature_recipe {os.path.relpath(path, workspace.root)} "
+                f"--objective lambdarank")
+        return TrialSpec(
+            dimension="features",
+            hypothesis=f"Feature recipe '{recipe.name}': {rationale}",
+            mechanism=rationale,
+            args=args,
+            command=f"{PY} -m pipeline.train {args}"
+                    + (f" --data_dir {self.data_dir}" if self.data_dir else ""),
+            checkpoint="lgb",
+            # A recipe is neither a flag toggle nor a code patch: its ranges are
+            # enforced, its identity is a hash of its behaviour, and re-running
+            # the id reproduces the features exactly. Logging it as either of
+            # the other two would misdescribe it.
+            source="recipe",
+            recipe_id=recipe.recipe_id,
+            recipe=recipe.model_dump(),
+        )
 
     def _implement_first(self, ctx: ResearchContext, workspace,
                          hypotheses, trace: List[str]):

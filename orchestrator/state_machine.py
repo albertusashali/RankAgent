@@ -425,6 +425,55 @@ class RankAgentOrchestrator:
                   f"running configuration-only against the repository")
             return None
 
+    @staticmethod
+    def _touched_features(spec) -> bool:
+        impl = getattr(spec, "implementation", None)
+        return bool(impl and any(p.endswith("features.py") for p in impl.target_files))
+
+    def _feature_audit(self, workspace, env, cwd) -> Optional[str]:
+        """Run the feature agent's audits inside the node. None means clean.
+
+        Run as a subprocess, not imported: the audits must exercise the
+        workspace's own ``features.py``, and importing generated code into the
+        orchestrator would both pollute ``sys.modules`` and put a crash in that
+        code on the critical path of the run.
+        """
+        out = os.path.join(workspace.root, "feature_audit.json")
+        cmd = (f"{PY} -m pipeline.feature_agent --dynamic --output {out}")
+        res = self.runner.run_command(self._with_data_dir(cmd), env_vars=env,
+                                      cwd=cwd, timeout_seconds=300)
+        if res.status == "SUCCESS" or "PASS" in (res.stdout_summary or ""):
+            return None
+        detail = ""
+        try:
+            with open(out, encoding="utf-8") as fh:
+                report = json.load(fh)
+            dyn = report.get("dynamic_audit", {})
+            static = report.get("static_audit", {})
+            if dyn and not dyn.get("current_row_outcome_invariant", True):
+                forbidden = ", ".join(sorted(
+                    static.get("forbidden_current_row_sources", [])))
+                detail = (
+                    "A feature changed when the row's OWN outcome columns were "
+                    f"mutated, so it reads a post-impression value ({forbidden}). "
+                    "Those are withheld on the hidden test split, so the feature "
+                    "scores well in development and is meaningless at submission "
+                    "time. Derive features from OTHER rows via CausalStats, never "
+                    "from the row being scored.")
+            elif dyn and not dyn.get("all_values_finite", True):
+                detail = ("A feature produced NaN or infinity. Guard the divisions "
+                          "and use the smoothed-prior fallback the other features use.")
+            elif static.get("status") == "FAIL":
+                detail = (f"The feature manifest no longer matches the code. "
+                          f"missing manifests: {static.get('missing_manifests')}; "
+                          f"stale manifests: {static.get('stale_manifests')}; "
+                          f"unsafe: {static.get('unsafe_current_row_features')}. "
+                          f"Every feature CausalStats produces must be declared in "
+                          f"FEATURE_MANIFESTS in pipeline/feature_agent.py.")
+        except (OSError, ValueError):
+            pass
+        return detail or (res.error_traceback or "the feature audit failed")[-1200:]
+
     def _record_failure(self, iteration_id, parent_id, spec, plan, command, res,
                         tokens_before, note: str) -> bool:
         """Log a trial that never produced metrics, and keep the run going."""
@@ -512,6 +561,24 @@ class RankAgentOrchestrator:
 
         env = workspace.env() if workspace else None
         cwd = workspace.root if workspace else None
+
+        # Feature audit gate. Runs before the smoke train whenever this node
+        # touched features.py, because a leak there is the one failure the
+        # static scanner in sandbox/verifier.py cannot see: it matches tokens,
+        # so it catches `row['play_time_ms']` but not the same value reached
+        # through a helper, a rename or an aggregate. The audit mutates a row's
+        # outcome columns and asserts that row's feature vector does not move,
+        # which is an information-flow test rather than a syntactic one.
+        if workspace is not None and self._touched_features(spec):
+            audit = self._feature_audit(workspace, env, cwd)
+            if audit is not None:
+                print(f"  [FEATURE AUDIT] FAILED — {audit[:120]}")
+                return self._record_failure(
+                    iteration_id, parent_id, spec, plan, command,
+                    ExecutionResult(status="RUNTIME_ERROR", error_traceback=audit,
+                                    command_executed="pipeline.feature_agent"),
+                    tokens_before, note="feature audit failed")
+            print("  [FEATURE AUDIT] passed (no current-row outcome reaches a feature)")
 
         # Smoke gate: one epoch on a small user subsample, ~5s. Generated code
         # fails often, and without this every syntax slip or shape bug costs a
@@ -642,6 +709,8 @@ class RankAgentOrchestrator:
             stage=spec.dimension, hypothesis=spec.hypothesis,
             rationale=spec.mechanism, target_file=target_file,
             command=command, proposal_source=spec.source,
+            method_id=spec.method_id, citation=spec.citation,
+            recipe_id=spec.recipe_id, recipe=spec.recipe,
             # The diff is computed from the bytes on disk before and after the
             # patch, against this node's PARENT — not from what the model said
             # it did, and not from `git diff` over the repo working tree, which
@@ -874,9 +943,37 @@ class RankAgentOrchestrator:
         # the most important fact about the run.
         best = next((e for e in entries
                      if e.get("iteration_id") == self.tree.best_node_id), None)
+        # The best result the agent reached BY WRITING CODE, reported separately
+        # from the best result overall. They can differ: a configuration-only
+        # trial may win, and when it does a single `best_node_had_code_change:
+        # false` was the only trace that eight patches had been written and
+        # measured. Reporting both keeps the code contribution visible without
+        # overstating which one was submitted.
+        coded = [e for e in trials
+                 if (e.get("code_diff") or "").strip()
+                 and (e.get("metrics") or {}).get("primary_score") is not None]
+        top_coded = max(coded, key=lambda e: e["metrics"]["primary_score"],
+                        default=None)
+
+        # Recipe trials are their own category. A recipe is neither a flag
+        # toggle nor a code patch: its ranges are validated, its identity is a
+        # hash of its behaviour, and re-running the id reproduces the features
+        # exactly. Folding it into either of the others would misreport what the
+        # agent actually did.
+        recipes = [e for e in trials if e.get("recipe_id")]
+
         return {
             "llm_available": self.team.llm_available,
             "iterations_total": len(trials),
+            "recipe_trials": len(recipes),
+            "distinct_recipes": len({e["recipe_id"] for e in recipes}),
+            "best_code_authored": {
+                "iteration": top_coded["iteration_id"],
+                "primary": top_coded["metrics"]["primary_score"],
+                "target_file": top_coded.get("target_file"),
+                "hypothesis": top_coded.get("hypothesis"),
+                "is_overall_best": top_coded["iteration_id"] == self.tree.best_node_id,
+            } if top_coded else None,
             "iterations_llm_authored": len(llm_authored),
             "iterations_from_playbook": len(trials) - len(llm_authored),
             "nodes_with_generated_code": len(with_code),
@@ -940,6 +1037,15 @@ class RankAgentOrchestrator:
         print(f"  llm-authored       : "
               f"{summary.autonomy.get('iterations_llm_authored', 0)}"
               f"/{summary.autonomy.get('iterations_total', 0)} iterations")
+        if summary.autonomy.get("recipe_trials"):
+            print(f"  feature recipes    : {summary.autonomy['recipe_trials']} trial(s), "
+                  f"{summary.autonomy['distinct_recipes']} distinct")
+        bc = summary.autonomy.get("best_code_authored")
+        if bc:
+            print(f"  best from code     : {bc['primary']:.4f} at iteration "
+                  f"{bc['iteration']} ({bc['target_file']})"
+                  + ("  <- also the overall best" if bc["is_overall_best"]
+                     else "  (overall best was a configuration-only trial)"))
         print(f"  manual intervention: {self.ledger.summary_line()}")
         if summary.submission_decision.get("rationale"):
             print(f"  designated         : {summary.submission_decision['rationale']}")

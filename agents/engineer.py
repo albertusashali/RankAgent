@@ -32,6 +32,7 @@ from pydantic import BaseModel, Field
 
 from agents.base import Agent, validated
 from agents.context import ResearchContext, command_signature, parse_flags
+from agents.knowledge import citation_for
 from agents.researcher import Hypothesis
 
 PY = sys.executable
@@ -60,6 +61,10 @@ class TrialSpec(BaseModel):
     args: str
     command: str
     checkpoint: Optional[str] = None
+    #: The published method this draws on, and its citation. Substituted from
+    #: the knowledge base by id, never typed by the model.
+    method_id: str = "novel"
+    citation: str = ""
     #: Who authored the hypothesis this spec implements: "llm" or "playbook".
     #: NO DEFAULT, deliberately. It used to default to "llm", and because the
     #: only construction site never passed it, every iteration in every archived
@@ -68,6 +73,11 @@ class TrialSpec(BaseModel):
     #: logs are a deliverable, so the field has to be impossible to leave unset.
     source: str
     implementation: Optional[Implementation] = None
+    #: Set when this trial is a Feature Steward recipe rather than code or a
+    #: flag toggle. The id is a hash of the recipe's behaviour, so re-running it
+    #: reproduces the same features exactly.
+    recipe_id: Optional[str] = None
+    recipe: Optional[dict] = None
     rejected: List[str] = Field(default_factory=list)
 
 
@@ -345,6 +355,8 @@ class EngineerAgent(Agent):
         return TrialSpec(dimension=h.dimension, hypothesis=h.hypothesis,
                          mechanism=h.mechanism, args=args, command=command,
                          checkpoint=checkpoint_name(args), source=h.source,
+                         method_id=getattr(h, "method_id", "novel"),
+                         citation=citation_for(getattr(h, "method_id", "novel")),
                          rejected=list(rejected))
 
     @staticmethod

@@ -1,293 +1,238 @@
-# RankAgent: Autonomous ML Research Agent for Recommender Systems
+# RankAgent
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Python: 3.10+](https://img.shields.io/badge/Python-3.10+-brightgreen.svg)](https://www.python.org/)
-[![Benchmark: KuaiRand](https://img.shields.io/badge/Benchmark-KuaiRand--Pure-orange.svg)](https://kuairand.com)
-[![Baseline: reproduced](https://img.shields.io/badge/Baseline-reproduced%200.6015-success.svg)]()
-[![Tests: 16 passing](https://img.shields.io/badge/Tests-16%20passing-success.svg)]()
+An autonomous ML research agent for the **KuaiRand-Pure** within-user ranking
+benchmark. It reproduces the organizers' baseline, then improves on it by
+**writing and running its own code** — new loss functions, new architectures, new
+feature logic — verifying each change before spending a training run on it.
 
-> **RankAgent** is an LLM-driven autonomous machine learning research agent engineered specifically for recommender system (RecSys) ranking problems. Given a tabular/interaction dataset and target metrics, RankAgent autonomously drives the closed-loop cycle of problem formulation, exploratory data analysis, feature engineering, architecture search & multi-task modeling, training/tuning, and rigorous offline evaluation with self-healing reflection.
-
----
-
-## 📌 Table of Contents
-- [1. Project Overview & State Machine](#1-project-overview--state-machine)
-- [2. System Architecture — Four Specialised Agents](#2-system-architecture--four-specialised-agents)
-- [3. Benchmark & Metric Specification](#3-benchmark--metric-specification)
-- [4. Repository & File Partitioning](#4-repository--file-partitioning)
-- [5. Setup & Reproduction](#5-setup--reproduction)
-- [6. Evaluation, Convergence & Submission](#6-evaluation-convergence--submission)
-- [7. Status & Remaining Work](#7-status--remaining-work)
-- [8. Documentation Index](#8-documentation-index)
-
----
-
-## 1. Project Overview & State Machine
-
-Machine learning engineering for recommendation systems (e.g., short-video CTR/long-view prediction) is inherently cyclic. RankAgent automates this entire loop without human intervention by operating as a finite state machine backed by agentic tree search:
-
-$$\text{INIT} \longrightarrow \text{HYPOTHESIZE} \longrightarrow \text{GENERATE} \longrightarrow \text{RUN} \longrightarrow \text{EVAL} \longrightarrow \text{REFLECT / PRUNE} \longrightarrow \text{HALT}$$
-
-```mermaid
-graph TD
-    A["Stage 1: Read Problem & Load Data<br/>(KuaiRand splits, label: long_view, ID alignments)"] --> B["Stage 2: Inspect Data & RecSys EDA<br/>(Sparsity, feedback correlation, user activity skew)"]
-    B --> C["Stage 3: Feature Engineering (pipeline/features.py)<br/>(Target encoding, history aggregations, crossing)"]
-    C --> D["Stage 4: Architecture & Multi-Task Design (pipeline/models.py)<br/>(FM, DeepFM, DCN-v2, MMoE, Censored Regression)"]
-    D --> E["Stage 5: Train, Tune & Evaluate (pipeline/train.py)<br/>(GAUC & nDCG@5 calculation via evaluate.py)"]
-    E --> F{"Convergence Check<br/>(Delta <= 0.002 over 3 iters OR 50 iters / 6h)"}
-    F -->|"Not Converged"| G["Reflect & Revise (Tree Search & Backtracking)<br/>(Analyze failure/delta, formulate new hypothesis)"]
-    G --> C
-    F -->|"Converged / Cap"| H["Final Submission Packaging (pipeline/submit.py)<br/>(Generate validation-best submission.csv with row_id)"]
+```
+python main.py --data_dir data/KuaiRand-Pure/data --max_iterations 30
 ```
 
 ---
 
-## 2. System Architecture — Four Specialised Agents
+## 1. What it does
 
-RankAgent runs its loop as four agents coordinating over a shared **blackboard**,
-rather than one prompt doing domain reasoning, code generation and debugging at once.
+The benchmark ranks a user's own impressions. Label `long_view`; metrics GAUC and
+nDCG@5; the primary score is their mean. The official Factorization Machine
+baseline scores **0.6016** on validation.
 
-```
-        ┌──────────────────────────────────────────────┐
-        │            Product Manager Agent             │   owns COVERAGE
-        │   which axis to work on; when to rotate      │   runs every N iters
-        └───────────────────────┬──────────────────────┘
-        ┌───────────────────────▼──────────────────────┐
-        │             ML Research Agent                │   owns HYPOTHESES
-        │   what to try, and the mechanism why         │   k per call
-        └───────────────────────┬──────────────────────┘
-        ┌───────────────────────▼──────────────────────┐
-        │            Engineer (SWE) Agent              │   owns RUNNABILITY
-        │   validates against the REAL argparse spec   │   rejects duplicates
-        └───────────────────────┬──────────────────────┘
-        ┌───────────────────────▼──────────────────────┐
-        │            QA & Debugger Agent               │   owns TRUST
-        │   pre-flight, result verdicts, self-healing  │
-        └──────────────────────────────────────────────┘
+Each iteration, five agents run one experiment:
 
-              all four read/write one ResearchContext
-```
+| Role | Owns | Output |
+| :--- | :--- | :--- |
+| **Product Manager** | coverage across seven research dimensions | a directive |
+| **ML Researcher** | hypotheses, grounded in a citation-bearing knowledge base | k hypotheses |
+| **Engineer** | writing the code | a source patch |
+| **Feature Steward** | the feature space | a validated feature recipe |
+| **QA** | trust | gate verdicts, and repairs |
 
-**Why a blackboard, not a pipeline.** In a chain each handoff is a lossy
-paraphrase. An earlier single-agent run logged a hypothesis about DCN-v2 while
-executing `--model mmoe`; a four-stage chain would give that drift three more
-places to happen. Here agents exchange typed objects, never prose.
+The agent's action space is **file I/O**, not a flag menu. A typical iteration
+reads `pipeline/models.py`, writes a patch implementing (say) ApproxNDCG,
+registers it so `--loss approx_ndcg` becomes selectable, verifies it, trains it,
+and records the diff. Runs have produced working implementations of ApproxNDCG,
+ListMLE, focal loss, DCN-v2, PLE and a multi-head cross-attention ranker — none
+of which existed in the codebase.
 
-**What each role prevents.** Every split is traceable to a logged failure:
+### Measured results
 
-| Role | Failure it prevents |
-| :--- | :--- |
-| Product Manager | A run that spent 4 iterations on one axis and **never varied the loss** — the strongest measured lever. Tracks 7 dimensions, directs at untried ones, rotates when stalled. |
-| Researcher | Hypotheses without mechanisms; re-deriving the organizers' measured dead ends. |
-| Engineer | A logged hypothesis that doesn't match the command that ran. Every command is parsed against the real spec and checked against history. |
-| QA | Trusting a broken result. Rejects scores below the random floor (0.4834) or above the oracle ceiling (0.8484). |
+| | validation primary | vs baseline |
+| :--- | ---: | ---: |
+| Random scoring floor | 0.4834 | — |
+| **Official FM baseline (published)** | **0.6016** | — |
+| Our reproduction of it | 0.6015 | −0.0001 |
+| Best agent-written model (`cross_attention`) | **0.6041** | **+0.0026 (3.2σ)** |
+| `dense_deepfm` (causal features in a neural model) | 0.6024 | +0.0009 |
+| Oracle ceiling | 0.8484 | — |
 
-**Cost control.** Naively four calls per iteration would push the run into the
-most expensive Feasibility tier for no gain. The PM runs every 3 iterations, the
-Researcher returns several hypotheses per call, and Engineer and QA only call out
-on failure. A measured 5-iteration run used **7 calls, 8,774 tokens** — roughly
-1.4 calls per iteration — attributed per role in `RunSummary.cost_by_agent`.
-
-**Without an API key** every agent has a deterministic fallback and the whole team
-runs at zero tokens, covering all 7 dimensions in 10 iterations.
-
-Full detail: [`docs/AGENT_ARCHITECTURE.md`](docs/AGENT_ARCHITECTURE.md).
-
-### Supporting subsystems
-
-```
-orchestrator/   FSM loop, exploration tree, convergence rule, Pydantic contracts
-sandbox/        subprocess runner (one framework per process), parser, logger
-pipeline/       data (hidden-test sealed), features (causal), models, train, submit
-agents/         the four roles + blackboard + playbook
-```
+Seed noise is σ = 0.0008, so a gain under 0.0024 is not evidence. The agent
+designates its own final submission and records the margin in units of σ.
 
 ---
 
-## 3. Benchmark & Metric Specification
+## 2. Setup
 
-### 3.1 KuaiRand-Pure Benchmark (Primary Required)
-* **Domain**: Short-video recommendation feed (Kuaishou KuaiRand-Pure dataset).
-* **Interactions**: ~1.4M logged interactions (27,285 users $\times$ 7,583 items).
-* **Feedback Signals**: 12 signals (`click`, `like`, `follow`, `comment`, `forward`, `long_view`, `play_time`, etc.).
-* **Target Label**: `long_view` (binary native column).
-* **Splits (Date-based)**:
-  * **Train**: `2022-04-08` to `2022-04-21` (1,141,112 rows)
-  * **Validation**: `2022-04-22` to `2022-04-28` (124,909 rows)
-  * **Hidden Test**: `2022-04-29` to `2022-05-08` (170,588 rows)
-
-### 3.2 Target Metrics & Baseline Score
-* **Evaluation Metrics**:
-  * $\text{GAUC}$: Per-user AUC weighted by positive count ($0 < \text{positives} < \text{impressions}$).
-  * $\text{nDCG@5}$: Discounted cumulative gain ($2^{\text{rel}} - 1$) within user impressions; users with 0 positives scored as 0.
-  * $\text{Primary Score} = \frac{\text{GAUC} + \text{nDCG@5}}{2}$.
-* **Official Baseline**: Factorization Machine ($k=16, \text{lr}=0.001$, 5 categorical fields, NumPy CPU ~40s).
-  * Validation: $\text{GAUC} = 0.6674 \mid \text{nDCG@5} = 0.5357 \mid \mathbf{\text{Primary} = 0.6016}$.
-  * Hidden-Test: $\text{GAUC} = 0.6610 \mid \text{nDCG@5} = 0.5282 \mid \mathbf{\text{Primary} = 0.5946}$.
-  * Attainable theoretical ceiling: $\mathbf{\text{Primary} = 0.8645}$.
-
----
-
-## 4. Repository & File Partitioning
-
-```
-RankAgent/
-├── README.md                      # This project overview & roadmap
-├── requirements.txt               # PyTorch, LightGBM, Pandas, Pydantic, LLM SDKs
-├── configs/
-│   ├── agent_config.yaml          # Search budget (50 iters, 6h cap) & debugger settings
-│   └── benchmark_kuairand.yaml    # KuaiRand dataset splits and metric rules
-├── orchestrator/                  # MEMBER 1: State Machine & Search
-│   ├── state_machine.py           # FSM loop controller
-│   ├── tree_manager.py            # Non-linear tree search & robust convergence tracker
-│   └── schemas.py                 # Pydantic data contracts (MetricResult, ExecutionResult)
-├── sandbox/                       # MEMBER 2: Execution & Telemetry
-│   ├── runner.py                  # Subprocess runner with 6-hour ceiling
-│   ├── parser.py                  # Regex parser for [EVAL] GAUC & nDCG@5
-│   ├── debugger.py                # Self-healing loop (max 3 retries)
-│   └── logger.py                  # run_summary.json telemetry writer
-├── prompts/                       # MEMBER 3: Domain KB & Prompts
-│   ├── templates.py               # Hypothesis & code diff prompt templates
-│   └── recsys_kb.py               # Prompt-ready KuaiRand RecSys playbook
-├── pipeline/                      # MEMBER 4: Modular Target Pipeline
-│   ├── data.py                    # Date-based train/val split loader
-│   ├── features.py                # Feature transforms & target encodings
-│   ├── models.py                  # Model architectures (FM, DeepFM, MMoE)
-│   ├── train.py                   # Loss balancing & training loop
-│   ├── evaluate.py                # Official starter kit evaluation script
-│   └── submit.py                  # Strict row_id submission formatter
-├── logs/                          # Run artifacts, JSON logs, and markdown journals
-└── docs/                          # Architecture, Strategy, Run-Log Spec, Devpost report
-```
-
----
-
-## 5. Setup & Reproduction
-
-Every step below is a `make` target, verified on a clean clone (macOS, Python 3.14, CPU only).
+**Requirements:** Python 3.11+ (developed on 3.14), ~4 GB RAM, no GPU needed.
+A full run takes 10–40 minutes on a laptop CPU.
 
 ```bash
 git clone https://github.com/albertusashali/RankAgent.git
 cd RankAgent
-
-make venv        # .venv + dependencies
-make data        # download and extract KuaiRand-Pure (~1.4M interactions)
-make sanity      # harness self-check: random scoring must reach test primary ~0.4753
-make test        # 16 tests: scorer parity, hidden-test seal, leak regressions, convergence
-make baseline    # reproduce the official FM baseline -> valid primary 0.6015
-make agent       # run the autonomous loop end to end
+python -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
 ```
 
-**Verified output.**
-
-| Step | Expected | Measured |
-| :--- | :--- | :--- |
-| `make sanity` | test primary ~ 0.4753 | 0.4757 |
-| `make baseline` | valid primary 0.6016 | **0.6015** (epoch-for-epoch identical to the starter kit) |
-| `make test` | all pass | 16 passed |
-
-### 5.1 Training a single model
+**Data.** Download KuaiRand-Pure and unpack it so the logs sit at
+`data/KuaiRand-Pure/data/`:
 
 ```bash
-python -m pipeline.train --model fm_torch --loss listwise --epochs 15
-python -m pipeline.train --model mmoe --loss listwise --experts 4 --epochs 12
-python -m pipeline.train --model lgb --objective lambdarank --trees 400
+mkdir -p data && curl -L https://zenodo.org/records/10439422/files/KuaiRand-Pure.tar.gz \
+  | tar -xz -C data
+ls data/KuaiRand-Pure/data/log_standard_4_08_to_4_21_pure.csv
 ```
 
-`--model` accepts `fm | fm_torch | deepfm | din | mmoe | lgb`; `--loss` accepts
-`pointwise | listwise | bpr`. Each run writes `checkpoints/<name>.meta.json` recording its
-exact constructor arguments, so the submission step rebuilds the model rather than guessing.
-
-> **Note on PyTorch and LightGBM.** The two vendor conflicting OpenMP runtimes and segfault
-> if both are loaded into one process, in either import order. Neither is imported at module
-> scope; each trainer imports only what it needs, and every trial runs in its own subprocess.
-> Ensembling across the two families therefore goes through cached predictions
-> (`--export`), not a shared process.
-
----
-
-## 6. Evaluation, Convergence & Submission
-
-### 6.1 The scorer is the official scorer
-
-`pipeline/evaluate.py` contains no metric implementation. It loads
-`kuairand-starter-kit/evaluate.py` verbatim, so the score we select on is byte-identical to
-the score we are ranked on. `tests/test_harness.py` asserts this and pins the tie-handling
-behaviour that a reimplementation gets wrong.
-
-### 6.2 The hidden test set is sealed in code
-
-The challenge requires the agent develop on train + validation only. That is enforced, not
-merely intended:
-
-* `load_kuairand()` returns **train and valid only**.
-* `include_test=True` returns test rows with `label = -1` — features, never targets.
-* Real test labels require `RANKAGENT_UNSEAL_TEST=1`, which the runner explicitly strips
-  from every trial's environment.
-
-An iteration that tries to select on test performance fails loudly instead of leaking.
-
-### 6.3 Convergence
-
-A run halts when validation primary has not improved by more than eps = 0.002 over the last
-N = 3 iterations — a property of the *best-so-far curve*, not of a single iteration — or on
-the 50-iteration cap or 6-hour ceiling.
-
-### 6.4 Submission
+**API key** (optional — the system runs fully without one, see §3.4):
 
 ```bash
-# score each model in its own process, then blend on validation
-python -m pipeline.submit --export --checkpoint fm_torch_listwise
-python -m pipeline.submit --export --checkpoint mmoe
-python -m pipeline.submit --generate --checkpoint fm_torch_listwise mmoe \
-    --file submissions/kuairand_pure_final.csv
-
-# validate against the organizer's own checker
-cd kuairand-starter-kit && python submit.py --check --split test \
-    ../submissions/kuairand_pure_final.csv --data_dir ../data/KuaiRand-Pure/data
+cp .env.example .env
+# then edit .env and set OPENAI_API_KEY or ANTHROPIC_API_KEY
 ```
 
-The final file passes both our checker and the starter kit's: 170,588 rows, correct header,
-contiguous `row_id`, and row-for-row `user_id`/`video_id` alignment.
+---
 
-### 6.5 Results
+## 3. Reproducing our results
 
-Measured on validation; see [`docs/DEVPOST_SUBMISSION.md`](docs/DEVPOST_SUBMISSION.md) for the
-full table and [`logs/run_summary.json`](logs/run_summary.json) for the run record.
+### 3.1 Verify the harness — free, ~20 seconds
 
-| | Valid primary | Delta vs baseline |
-| :--- | ---: | ---: |
-| Official FM baseline | 0.6015 | 0.0000 |
-| FM, pointwise BCE (control) | 0.6011 | -0.0004 |
-| FM, within-user listwise softmax | 0.6024 | +0.0009 |
-| MMoE, listwise | 0.6021 | +0.0006 |
-| **Rank-blend (FM-listwise 0.45 / MMoE 0.55)** | **0.6040** | **+0.0025** |
+```bash
+.venv/bin/python -m pytest tests/ -q
+```
+Expect `86 passed`. No API key, no data, no training.
 
-Hidden-test scores are deliberately absent: the agent cannot compute them.
+```bash
+.venv/bin/python scripts/smoke_agents.py
+```
+Expect `ALL CHECKS PASSED`. This plans ten iterations with zero API calls,
+applies a real patch, proves a newly registered loss becomes CLI-selectable,
+tampers with the scorer and shows it reverted, and attempts five known leaks and
+shows each blocked.
+
+### 3.2 Reproduce the official baseline — ~90 seconds
+
+```bash
+.venv/bin/python -m pipeline.train --model fm --data_dir "$(pwd)/data/KuaiRand-Pure/data"
+```
+Expect `Primary: 0.6015` against the published 0.6016. The agent runs this itself
+at iteration 0 of every run and **halts** if the drift exceeds 0.005 — every
+later delta is measured against a reference that was verified, not typed in.
+
+### 3.3 A full autonomous run — 10–40 min, roughly $1–3 of tokens
+
+```bash
+.venv/bin/python main.py --data_dir "$(pwd)/data/KuaiRand-Pure/data" --max_iterations 30
+```
+
+Then read what it did:
+
+```bash
+.venv/bin/python scripts/inspect_run.py
+```
+
+Artefacts: `logs/run_log.md` (human-readable, with every diff),
+`logs/run_summary.json` (machine-readable), `logs/runs/<run_id>.*` (archived),
+`workspaces/node_NNN/` (each iteration's code), and
+`submissions/kuairand_pure_final.csv`.
+
+### 3.4 Deterministic mode — no API key, no cost
+
+```bash
+OPENAI_API_KEY=none ANTHROPIC_API_KEY=none \
+  .venv/bin/python main.py --data_dir "$(pwd)/data/KuaiRand-Pure/data" --max_iterations 5
+```
+Every agent has a hand-written fallback, so the loop runs end to end with zero
+tokens. The log says so plainly — `llm_available: false`, and a banner stating
+the run demonstrates the harness rather than autonomy. A run with no key and a
+run driven by a model must never be confusable in the artefact a judge reads.
+
+### 3.5 Feature governance
+
+```bash
+.venv/bin/python -m pipeline.feature_agent --dynamic \
+  --data_dir "$(pwd)/data/KuaiRand-Pure/data"
+```
+Expect `[FEATURE AUDIT] PASS`.
 
 ---
 
-## 7. Status & Remaining Work
+## 4. Limitations, honestly
 
-**Done.** Baseline reproduces exactly; the scorer is the official one; the hidden-test seal is
-enforced in code and tested; the two label leaks (DIN history, target encoding) are fixed and
-covered by regression tests; the loop survives failures and recovers from them; telemetry is
-real; the submission passes the organizer's checker.
+**The gain is small and near the noise.** +0.0026 at 3.2σ clears the
+significance bar, but only just, and run-to-run variance (0.6038 vs 0.6041 on
+identical setups) is comparable to the effect. Two runs are not evidence of a
+reliable improvement, and the final ranking is on a hidden test set where a
+validation gain this size may not transfer.
 
-**Open**, in priority order — see [`docs/AUDIT_AND_PLAN.md`](docs/AUDIT_AND_PLAN.md):
+**Improvements compound only weakly.** Each node inherits its parent's code, and
+a node within 3σ of the best stays eligible as a parent — so neutral changes are
+not discarded. But acceptance is still driven by a single validation score, and
+in practice chains stay short. A 30-iteration run has not yet produced a node
+whose result depends on three stacked edits.
 
-1. **Multi-seed acceptance gating.** +0.0025 is barely 3 sigma; no gain is defensible on one seed.
-2. **A real code action space.** The agent selects among curated hypotheses over an existing
-   trainer rather than writing Python. This is the largest gap against the brief.
-3. **Unbiased validation** against the randomised-exposure log (already exposed by the loader).
-4. **Censored watch-time regression.** `play_time_ms` is loaded and still unused as a target.
+**Generated losses are worse than generated architectures.** ApproxNDCG, ListMLE
+and focal loss all ran and all scored well below baseline (0.48–0.55), while
+DCN-v2 and PLE landed near it on a first attempt. The nDCG-family objectives
+need per-group sorting over a ragged batch, which is genuinely hard to get right;
+we added a `group_padded` helper to make it writable, and they still come out
+poor. The PM keeps directing effort at `loss` first because it is the
+highest-priority dimension, which spends budget on the agent's weakest area.
+
+**A patch can be a silent no-op.** One run produced a `CyclicLR` scheduler that
+was constructed and never stepped — a one-line diff claiming a training-schedule
+change that did nothing. Nothing detects a patch that cannot affect the result.
+
+**Converges early.** Halting needs no 0.002 gain over three iterations, which is
+the *normal* state of this benchmark, so runs stop around iteration 11 of 30.
+
+**Scope we did not cover.** Only KuaiRand-Pure; the loaders hard-code the Pure
+filenames and split dates, so the 1K/27K variants would silently produce empty
+splits. Preprocessing and post-processing (calibration, N-way blending, per-user
+re-ranking) remain immutable, so *"every upstream and downstream module is fair
+game"* is only partly satisfied. There is no run resumption: a process killed at
+iteration 25 loses the tree, though the log and submission remain readable.
+
+### Given more time
+
+1. **Make composition the point of the search.** Explicit `draft` / `improve` /
+   `debug` node modes with UCB selection over a frontier, and lineage in the
+   Researcher's prompt, so the agent reasons about *what it has already built*.
+   This is the single change most likely to convert more iterations into a
+   better score.
+2. **Ensembling.** `blend_weight_on_valid` exists and is capped at two models.
+   Rank-normalised blending of decorrelated members (a GBDT and a neural ranker)
+   is historically the largest single gain on this kind of benchmark and we never
+   spent an iteration on it.
+3. **No-op detection.** AST dataflow to reject a patch whose new symbols are
+   never read.
+4. **Make preprocessing agent-editable**, behind the differential seal test that
+   already exists — eleven raw columns (`hourmin`, `time_ms`, `is_hate`, …) are
+   currently discarded before any agent sees them.
+5. **Multi-seed confirmation** before designating a submission, so the final
+   choice rests on n=3 means rather than a single noisy run.
 
 ---
 
-## 8. Documentation Index
+## 5. Team
 
-* [`docs/AGENT_ARCHITECTURE.md`](docs/AGENT_ARCHITECTURE.md): The four-agent design, the blackboard, and the measured failure each role prevents.
-* [`docs/ARCHITECTURE_DESIGN.md`](docs/ARCHITECTURE_DESIGN.md): Detailed subsystem designs, Pydantic schemas, and state machine workflows.
-* [`docs/EXPERIMENT_STRATEGY.md`](docs/EXPERIMENT_STRATEGY.md): Phased RecSys exploration roadmap and prompt-ready domain playbook.
-* [`docs/RUN_LOG_SPEC.md`](docs/RUN_LOG_SPEC.md): Standardized JSON and Markdown schemas for hackathon run-logs.
-* [`docs/DEVPOST_SUBMISSION.md`](docs/DEVPOST_SUBMISSION.md): Complete hackathon project description and results template.
+Four contributors, by the branch each authored:
+
+| Contributor | Contribution |
+| :--- | :--- |
+| **albertus.ashali** | Initial RankAgent framework, orchestrator state machine, tree manager and run logging (`main`); PLE / DCN-v2 / BST models with dense feature support (`feature/domain_prompt`) |
+| **gohpk** | Multi-agent framework — PM / Researcher / Engineer / QA roles and the blackboard (`agent_creation`); the code-generation overhaul — per-node workspaces, patch engine, verification gates, submission designation (`codegen`) |
+| **brianyeo02** | Feature engineering and governance — the feature manifest, mutation-based leakage audit, and the validated recipe search space (`feature-engineering`) |
+| **kz** | Duplicate-experiment guard and failure containment (`feat/dupe_guard`) |
+
+Integration of `feature-engineering` into the code-generation branch, and the
+documentation, were done on `codegen`.
+
+> Roles above are inferred from commit authorship and branch contents — please
+> correct them before submission.
+
+---
+
+## 6. Where things are
+
+```
+main.py                  entry point
+agents/                  the five roles, the patch engine, the paper KB
+orchestrator/            the research loop, tree search, intervention ledger
+sandbox/                 workspaces, execution, verification, logging
+pipeline/                the ML pipeline the agent edits (and the parts it cannot)
+tests/                   86 tests, none needing an API key
+docs/ARCHITECTURE.md     system architecture and diagrams
+scripts/inspect_run.py   summarise the last run
+```
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the component map, data
+flow, and the mutable/immutable safety boundary.

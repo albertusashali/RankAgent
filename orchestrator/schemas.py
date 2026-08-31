@@ -69,6 +69,16 @@ class IterationLogEntry(BaseModel):
     command: str
     proposal_source: str = "llm"
     code_diff: str = ""
+    #: The published method this iteration drew on, and its reference. The
+    #: citation is looked up from a fixed table by id, so it cannot be
+    #: hallucinated by the model.
+    method_id: str = "novel"
+    citation: str = ""
+    #: Set when the trial was a Feature Steward recipe. A recipe is neither a
+    #: flag toggle nor a code patch: its ranges are validated, its id is a hash
+    #: of its behaviour, and re-running the id reproduces the features exactly.
+    recipe_id: Optional[str] = None
+    recipe: Optional[Dict[str, Any]] = None
     status: Literal["ACCEPTED", "REJECTED", "ERROR_RECOVERED", "FAILED"]
     metrics: Optional[Dict[str, Any]] = None
     delta_over_baseline: Optional[float] = None

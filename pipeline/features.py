@@ -28,6 +28,8 @@ from typing import Any, Dict, List, Tuple
 
 import numpy as np
 
+from pipeline.feature_recipes import FeatureRecipe
+
 BASE_FIELDS = ['user_id', 'video_id', 'author_id', 'tab', 'dur_bucket']
 CWM_VIDEO_FIELDS = ['music_id', 'video_type', 'upload_type']
 
@@ -141,6 +143,40 @@ class _Counter:
         return (self.pos + m * prior) / (self.imp + m)
 
 
+class _RollingRates:
+    """Exact trailing-day positive/impression counts for several windows."""
+
+    def __init__(self, windows=(3, 7)):
+        self.windows = tuple(windows)
+        self.days = {w: collections.deque() for w in self.windows}
+        self.totals = {w: collections.defaultdict(lambda: [0.0, 0.0])
+                       for w in self.windows}
+
+    def add_day(self, date: int, observations):
+        daily = collections.defaultdict(lambda: [0.0, 0.0])
+        for key, label in observations:
+            daily[key][0] += float(label)
+            daily[key][1] += 1.0
+        for window in self.windows:
+            queue, totals = self.days[window], self.totals[window]
+            queue.append((date, daily))
+            for key, (pos, imp) in daily.items():
+                totals[key][0] += pos
+                totals[key][1] += imp
+            while queue and queue[0][0] <= date - window:
+                _old_date, old = queue.popleft()
+                for key, (pos, imp) in old.items():
+                    slot = totals[key]
+                    slot[0] -= pos
+                    slot[1] -= imp
+                    if slot[1] <= 0:
+                        del totals[key]
+
+    def rate(self, key, window: int, prior: float, m: float) -> float:
+        pos, imp = self.totals[window].get(key, (0.0, 0.0))
+        return (pos + m * prior) / (imp + m)
+
+
 class CausalStats:
     """Expanding-window engagement statistics.
 
@@ -153,22 +189,41 @@ class CausalStats:
     M_ITEM = 15.0
     M_CROSS = 8.0
 
-    FEATURE_NAMES = [
+    CORE_FEATURES = [
         'video_hist_count', 'video_hist_long_view_rate', 'video_hist_click_rate',
         'author_hist_count', 'author_hist_long_view_rate',
         'user_hist_count', 'user_hist_long_view_rate',
-        'user_author_affinity', 'user_durbucket_affinity', 'user_tab_affinity',
         'log_duration', 'dur_bucket', 'dur_to_user_avg_ratio',
         'completion_ratio_prior',
     ]
+    AFFINITY_FEATURES = [
+        'user_video_affinity', 'user_author_affinity',
+        'user_durbucket_affinity', 'user_tab_affinity',
+    ]
+    TEMPORAL_FEATURES = [
+        'video_completion_logratio', 'author_completion_logratio',
+        'user_author_completion_logratio', 'days_since_user_activity',
+        'days_since_video_seen', 'days_since_author_seen',
+        'days_since_user_author_seen',
+        'video_rate_3d', 'video_rate_7d', 'video_momentum_3d_vs_lifetime',
+        'user_author_rate_3d', 'user_author_rate_7d',
+        'user_author_momentum_3d_vs_lifetime',
+    ]
+    FEATURE_NAMES = CORE_FEATURES + AFFINITY_FEATURES + TEMPORAL_FEATURES
 
-    def __init__(self, dur_edges: np.ndarray, global_prior: float = 0.35):
+    def __init__(self, dur_edges: np.ndarray, global_prior: float = 0.35,
+                 recipe: FeatureRecipe = None):
         self.dur_edges = dur_edges
         self.prior = global_prior
+        self.recipe = recipe or FeatureRecipe()
+        self.M_ITEM = self.recipe.item_smoothing
+        self.M_CROSS = self.recipe.cross_smoothing
+        self.global_stats = _Counter()
         self.video = collections.defaultdict(_Counter)
         self.video_click = collections.defaultdict(_Counter)
         self.author = collections.defaultdict(_Counter)
         self.user = collections.defaultdict(_Counter)
+        self.user_video = collections.defaultdict(_Counter)
         self.user_author = collections.defaultdict(_Counter)
         self.user_dur = collections.defaultdict(_Counter)
         self.user_tab = collections.defaultdict(_Counter)
@@ -177,21 +232,35 @@ class CausalStats:
         # Mean completion ratio per duration bucket — a duration-bias correction
         # that needs no label at serve time.
         self.dur_completion = collections.defaultdict(lambda: [0.0, 0.0])
+        self.video_completion = collections.defaultdict(lambda: [0.0, 0.0])
+        self.author_completion = collections.defaultdict(lambda: [0.0, 0.0])
+        self.user_author_completion = collections.defaultdict(lambda: [0.0, 0.0])
+        self.last_user, self.last_video, self.last_author, self.last_user_author = {}, {}, {}, {}
+        self.video_recent = _RollingRates()
+        self.user_author_recent = _RollingRates()
 
     def _bucket(self, duration_ms: float) -> int:
         return int(np.searchsorted(self.dur_edges, duration_ms))
 
     def observe(self, rows: List[dict]):
+        labelled = [r for r in rows if r['label'] >= 0]
+        if labelled:
+            date = int(labelled[0]['date'])
+            self.video_recent.add_day(date, ((r['video_id'], r['label']) for r in labelled))
+            self.user_author_recent.add_day(
+                date, (((r['user_id'], r['author_id']), r['label']) for r in labelled))
         for r in rows:
             y = r['label']
             if y < 0:          # withheld test label — never folded in
                 continue
+            self.global_stats.add(y)
             u, v, a = r['user_id'], r['video_id'], r['author_id']
             b = self._bucket(r['duration_ms'])
             self.video[v].add(y)
             self.video_click[v].add(max(r.get('click', 0), 0))
             self.author[a].add(y)
             self.user[u].add(y)
+            self.user_video[(u, v)].add(y)
             self.user_author[(u, a)].add(y)
             self.user_dur[(u, b)].add(y)
             self.user_tab[(u, r['tab'])].add(y)
@@ -199,8 +268,19 @@ class CausalStats:
             self.user_dur_n[u] += 1.0
             dur = max(r['duration_ms'], 1.0)
             slot = self.dur_completion[b]
-            slot[0] += min(r.get('play_time_ms', 0.0) / dur, 5.0)
+            slot[0] += min(r.get('play_time_ms', 0.0) / dur,
+                           self.recipe.completion_ratio_clip)
             slot[1] += 1.0
+            # Current-row watch time would leak long_view. Only fold it into
+            # state after the row has been featurised.
+            logratio = np.log1p(max(r.get('play_time_ms', 0.0), 0.0)) - np.log1p(dur)
+            for completion in (self.video_completion[v], self.author_completion[a],
+                               self.user_author_completion[(u, a)]):
+                completion[0] += logratio
+                completion[1] += 1.0
+            date = int(r['date'])
+            self.last_user[u], self.last_video[v], self.last_author[a] = date, date, date
+            self.last_user_author[(u, a)] = date
 
     def featurise(self, row: dict) -> List[float]:
         u, v, a = row['user_id'], row['video_id'], row['author_id']
@@ -208,31 +288,51 @@ class CausalStats:
         b = self._bucket(dur)
 
         vc, ac, uc = self.video[v], self.author[a], self.user[u]
-        u_rate = uc.rate(self.prior, self.M_ITEM)
+        prior = self.global_stats.rate(self.prior, self.recipe.global_prior_strength)
+        u_rate = uc.rate(prior, self.M_ITEM)
         avg_dur = (self.user_dur_sum[u] / self.user_dur_n[u]) if self.user_dur_n[u] else dur
         comp = self.dur_completion[b]
+
+        def mean(slot):
+            return slot[0] / slot[1] if slot[1] else 0.0
+
+        def age(last):
+            cap = self.recipe.recency_cap_days
+            return float(min(max(int(row['date']) - last, 0), cap)) if last is not None else float(cap + 1)
 
         return [
             np.log1p(vc.imp),
             vc.rate(self.prior, self.M_ITEM),
             self.video_click[v].rate(0.15, self.M_ITEM),
             np.log1p(ac.imp),
-            ac.rate(self.prior, self.M_ITEM),
+            ac.rate(prior, self.M_ITEM),
             np.log1p(uc.imp),
             u_rate,
-            # Crosses back off to the user's own rate when unseen, so a cold pair
-            # is neutral rather than pulled toward the global prior.
-            self.user_author[(u, a)].rate(u_rate, self.M_CROSS),
-            self.user_dur[(u, b)].rate(u_rate, self.M_CROSS),
-            self.user_tab[(u, row['tab'])].rate(u_rate, self.M_CROSS),
             np.log1p(dur),
             float(b),
             float(dur / (avg_dur + 1.0)),
             (comp[0] / comp[1]) if comp[1] else 0.0,
+            self.user_video[(u, v)].rate(u_rate, self.M_CROSS),
+            self.user_author[(u, a)].rate(u_rate, self.M_CROSS),
+            self.user_dur[(u, b)].rate(u_rate, self.M_CROSS),
+            self.user_tab[(u, row['tab'])].rate(u_rate, self.M_CROSS),
+            mean(self.video_completion[v]), mean(self.author_completion[a]),
+            mean(self.user_author_completion[(u, a)]),
+            age(self.last_user.get(u)), age(self.last_video.get(v)),
+            age(self.last_author.get(a)), age(self.last_user_author.get((u, a))),
+            self.video_recent.rate(v, 3, prior, self.M_ITEM),
+            self.video_recent.rate(v, 7, prior, self.M_ITEM),
+            self.video_recent.rate(v, 3, prior, self.M_ITEM) -
+            vc.rate(prior, self.M_ITEM),
+            self.user_author_recent.rate((u, a), 3, u_rate, self.M_CROSS),
+            self.user_author_recent.rate((u, a), 7, u_rate, self.M_CROSS),
+            self.user_author_recent.rate((u, a), 3, u_rate, self.M_CROSS) -
+            self.user_author[(u, a)].rate(u_rate, self.M_CROSS),
         ]
 
 
-def extract_dense_tabular_features(splits: Dict[str, List[dict]]
+def extract_dense_tabular_features(splits: Dict[str, List[dict]], profile: str = 'affinity',
+                                   recipe: FeatureRecipe = None
                                    ) -> Tuple[Dict[str, tuple], List[str]]:
     """Dense engagement features, encoded causally.
 
@@ -242,12 +342,28 @@ def extract_dense_tabular_features(splits: Dict[str, List[dict]]
     """
     tr = splits['train']
     dur_edges = compute_dur_buckets([x['duration_ms'] for x in tr])
-    prior = float(np.mean([r['label'] for r in tr])) if tr else 0.35
-    stats = CausalStats(dur_edges, global_prior=prior)
-    names = CausalStats.FEATURE_NAMES
+    recipe = recipe or FeatureRecipe(base_profile=profile)
+    profile = recipe.base_profile
+    stats = CausalStats(dur_edges, global_prior=0.35, recipe=recipe)
+    profiles = {
+        'core': CausalStats.CORE_FEATURES,
+        'affinity': CausalStats.CORE_FEATURES + CausalStats.AFFINITY_FEATURES,
+        'full': CausalStats.FEATURE_NAMES,
+    }
+    if profile not in profiles:
+        raise ValueError(f"unknown feature profile {profile!r}; choose from {sorted(profiles)}")
+    all_names = CausalStats.FEATURE_NAMES
+    names = list(recipe.include_features or profiles[profile])
+    unknown = sorted(set(names + recipe.exclude_features) - set(all_names))
+    if unknown:
+        raise ValueError(f"recipe contains unknown feature(s): {unknown}")
+    names = [name for name in names if name not in set(recipe.exclude_features)]
+    if not names:
+        raise ValueError('recipe removed every feature')
+    keep = [all_names.index(name) for name in names]
 
     def pack(rows: List[dict], feats: List[List[float]]):
-        X = np.asarray(feats, dtype=np.float32).reshape(len(rows), len(names))
+        X = np.asarray(feats, dtype=np.float32).reshape(len(rows), len(all_names))[:, keep]
         y = np.asarray([r['label'] for r in rows], dtype=np.float32)
         return X, y, [r['user_id'] for r in rows]
 
@@ -274,6 +390,29 @@ def extract_dense_tabular_features(splits: Dict[str, List[dict]]
             out[name] = pack(splits[name], [stats.featurise(r) for r in splits[name]])
 
     return out, names
+
+
+def select_rank_features(dense: Dict[str, tuple], names: List[str],
+                         min_within_user_variance: float = 1e-10
+                         ) -> Tuple[Dict[str, tuple], List[str]]:
+    """Drop columns unable to change ordering within a user, using train only."""
+    X, _y, users = dense['train']
+    groups = collections.defaultdict(list)
+    for i, user in enumerate(users):
+        groups[user].append(i)
+    within = np.zeros(X.shape[1], dtype=np.float64)
+    weight = 0
+    for idxs in groups.values():
+        if len(idxs) >= 2:
+            within += np.var(X[idxs], axis=0) * len(idxs)
+            weight += len(idxs)
+    within /= max(weight, 1)
+    keep = np.flatnonzero(np.isfinite(within) & (within > min_within_user_variance))
+    if not len(keep):
+        raise ValueError('feature selector removed every feature')
+    selected = {split: (parts[0][:, keep], parts[1], parts[2])
+                for split, parts in dense.items()}
+    return selected, [names[i] for i in keep]
 
 
 # ---------------------------------------------------------------------------

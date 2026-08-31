@@ -34,9 +34,23 @@ class Hypothesis(BaseModel):
     target_file: str = ""
     edit_sketch: str = ""
 
+    #: Which published method this draws on. Must be an id from
+    #: ``agents.knowledge.KB`` or the literal "novel". The model chooses an id;
+    #: it never writes the citation itself, because a reference a model types is
+    #: a reference it can invent, and a fabricated citation in a submitted run
+    #: log is worse than no citation at all.
+    method_id: str = "novel"
+
     #: Who actually authored this: "llm" or "playbook". Deliberately has no
     #: default — see the note on TrialSpec.source in agents/engineer.py.
     source: str
+
+    @field_validator("method_id")
+    @classmethod
+    def _known_method(cls, v: str) -> str:
+        from agents.knowledge import KB
+        v = (v or "novel").strip().lower()
+        return v if v in KB else "novel"
 
     @field_validator("dimension")
     @classmethod
@@ -139,7 +153,9 @@ class ResearchAgent(Agent):
         self.proposals = proposals
 
     def _build_prompt(self, ctx: ResearchContext, **kwargs) -> str:
+        from agents.knowledge import entries_for as kb_entries_for
         d = ctx.directive
+        kb_entries = kb_entries_for(list(d.focus_dimensions) if d else list(DIMENSIONS))
         focus = ", ".join(d.focus_dimensions) if d else ", ".join(DIMENSIONS)
         avoid = ", ".join(d.avoid_dimensions) if d and d.avoid_dimensions else "nothing"
         tried = sorted(ctx.tried_signatures())
@@ -169,12 +185,18 @@ best first. Each must differ from every configuration already run.
 Code already applied to the pipeline you are extending:
   {ctx.lineage}
 
+Established methods available — set method_id to one of these ids, or "novel"
+if you are proposing something not on the list. Do NOT write a citation; it is
+attached automatically from the id you choose.
+{chr(10).join(kb_entries)}
+
 {{
   "hypotheses": [
     {{
       "dimension": "one of the focus dimensions",
       "hypothesis": "what you are testing",
       "mechanism": "why this should move a within-user ranking metric",
+      "method_id": "an id from the list above, or \\"novel\\"",
       "target_file": "pipeline/models.py, pipeline/features.py, pipeline/train.py, or \\"\\"",
       "edit_sketch": "the code change to make, concretely; empty if none is needed",
       "args": "--model ... --loss ..."

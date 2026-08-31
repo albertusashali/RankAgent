@@ -40,6 +40,14 @@ class TreeManager:
         self.min_iterations = (min_iterations if min_iterations is not None
                                else min(max(8, 3 * n_convergence),
                                         max(1, max_iterations // 2)))
+        #: Published seed standard deviation. A result within 3 sigma of the
+        #: best is not distinguishable from it, so its code stays eligible to
+        #: build on (see ``select_parent``).
+        self.seed_noise = 0.0008
+        #: Cap on how far a chain of neutral changes may run before the search
+        #: is forced back toward the best node. Without it the agent can walk
+        #: down a long line of individually-harmless edits.
+        self.max_depth = 6
 
         self.nodes: Dict[int, Dict[str, Any]] = {}
         self.best_primary_score: float = float('-inf')
@@ -66,14 +74,47 @@ class TreeManager:
         self.nodes[node_id] = {
             "parent_id": None, "hypothesis": "Reproduce official FM baseline",
             "target_file": "pipeline/train.py", "primary": primary,
-            "status": "ACCEPTED", "is_root": True,
+            "status": "ACCEPTED", "is_root": True, "depth": 0,
         }
 
     # -- tree -------------------------------------------------------------
 
     def select_parent(self) -> Optional[int]:
-        """Node to build the next hypothesis on: the current best (greedy)."""
-        return self.best_node_id
+        """Node whose CODE the next experiment should build on.
+
+        Not the same question as "which result is best", and conflating the two
+        is what stopped improvements compounding. Returning the global best made
+        a node a parent only if it *beat* everything before it. Generated code
+        rarely wins on its first attempt, so almost nothing became a parent,
+        every node restarted from the unmodified baseline, and a whole run's
+        worth of written code was discarded. One run produced 275 lines across
+        eight patches and submitted a model carrying none of them.
+
+        A change that neither helped nor hurt still added a *capability* the
+        next experiment can build on — DCN-v2 landing at 0.6011 against a 0.6015
+        best is inside seed noise, not a failure. So any node within 3 sigma of
+        the best is eligible, and among those the deepest wins, because depth is
+        accumulated work. Selection of the *submission* is untouched and remains
+        a strict argmax over validation.
+        """
+        if self.best_node_id is None:
+            return None
+        tolerance = 3 * self.seed_noise
+        eligible = [
+            (n.get("depth", 0), n["primary"], nid)
+            for nid, n in self.nodes.items()
+            if n.get("primary") is not None
+            and n["primary"] >= self.best_primary_score - tolerance
+            and n.get("depth", 0) < self.max_depth
+        ]
+        if not eligible:
+            return self.best_node_id
+        return max(eligible)[2]
+
+    def _depth_of(self, parent_id: Optional[int]) -> int:
+        if parent_id is None:
+            return 0
+        return self.nodes.get(parent_id, {}).get("depth", 0) + 1
 
     def add_node(self, node_id: int, parent_id: Optional[int], hypothesis: str,
                  target_file: str, metrics: Optional[MetricResult]) -> bool:
@@ -85,6 +126,7 @@ class TreeManager:
             self.nodes[node_id] = {
                 "parent_id": parent_id, "hypothesis": hypothesis,
                 "target_file": target_file, "primary": None, "status": "FAILED",
+                "depth": self._depth_of(parent_id),
             }
             return self._check_iteration_cap(node_id)
 
@@ -98,6 +140,7 @@ class TreeManager:
             "target_file": target_file, "primary": metrics.primary_score,
             "status": "ACCEPTED" if improved else "REJECTED",
             "is_best": improved,
+            "depth": self._depth_of(parent_id),
         }
 
         self.best_history.append(self.best_primary_score)

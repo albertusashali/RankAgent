@@ -45,6 +45,13 @@ IMMUTABLE: Tuple[str, ...] = (
     "pipeline/evaluate.py",         # the official scorer
     "pipeline/models_np.py",        # the reproducible baseline
     "pipeline/submit.py",
+    # The feature auditor and the recipe schema. Immutable for the same reason
+    # the scorer is: a checker the agent can edit is not a check. If generated
+    # code could weaken FORBIDDEN_CURRENT_ROW_SOURCES or relax the recipe's
+    # validated ranges, the leak gate would pass whatever it was asked to pass.
+    "pipeline/feature_agent.py",
+    "pipeline/feature_recipes.py",
+    "pipeline/diagnostics.py",
     "kuairand-starter-kit/evaluate.py",
 )
 

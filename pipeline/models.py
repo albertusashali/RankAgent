@@ -229,6 +229,38 @@ class DeepFM(nn.Module):
         return self.linear(x_cat).sum((1, 2)) + self.bias + inter + deep
 
 
+class DenseDeepFM(nn.Module):
+    """DeepFM fused with causal numerical signals for within-user ranking.
+
+    Identity embeddings learn memorised user/item interactions; the dense tower
+    learns smooth historical affinity, recency and completion effects and can
+    generalise to sparse or unseen ids.  LayerNorm keeps count and rate feature
+    scales from overwhelming the embedding branch.
+    """
+
+    def __init__(self, num_features: int, num_fields: int, num_dense: int,
+                 embed_dim: int = 16, hidden_dim: int = 96, dropout: float = 0.15):
+        super().__init__()
+        self.linear = nn.Embedding(num_features, 1)
+        self.factors = nn.Embedding(num_features, embed_dim)
+        self.bias = nn.Parameter(torch.zeros(1))
+        nn.init.zeros_(self.linear.weight)
+        nn.init.normal_(self.factors.weight, std=0.01)
+        self.dense_tower = nn.Sequential(
+            nn.LayerNorm(num_dense), nn.Linear(num_dense, 64), nn.ReLU(),
+            nn.Dropout(dropout), nn.Linear(64, 32), nn.ReLU())
+        self.fusion = nn.Sequential(
+            nn.Linear(num_fields * embed_dim + 32, hidden_dim), nn.ReLU(),
+            nn.Dropout(dropout), nn.Linear(hidden_dim, 1))
+
+    def forward(self, x_cat: torch.Tensor, x_dense: torch.Tensor) -> torch.Tensor:
+        vx = self.factors(x_cat)
+        inter = 0.5 * ((vx.sum(1) ** 2) - (vx ** 2).sum(1)).sum(1)
+        dense_rep = self.dense_tower(x_dense)
+        deep = self.fusion(torch.cat([vx.flatten(1), dense_rep], dim=1)).squeeze(1)
+        return self.linear(x_cat).sum((1, 2)) + self.bias + inter + deep
+
+
 class MMoE(nn.Module):
     """Multi-gate mixture-of-experts over the auxiliary feedback signals.
 
@@ -338,15 +370,22 @@ class DIN(nn.Module):
 #
 # Registering here is now the single step, mirroring LOSSES.
 
-def architecture(needs_history: bool = False):
+def architecture(needs_history: bool = False, needs_dense: bool = False):
     """Mark a builder with the inputs it needs.
 
     ``needs_history=True`` means the model takes the user's impression sequence
     as a second forward argument, and its embedding table is one row longer to
     hold the reserved padding id.
+
+    ``needs_dense=True`` means it takes the causal dense feature matrix as a
+    second forward argument instead. Those features were previously reachable
+    only through LightGBM, so no neural model had ever seen them — and that is
+    also what makes the Feature Steward's recipes matter beyond the GBDT branch.
+    The two flags are mutually exclusive: a model takes at most one side input.
     """
     def decorate(fn):
         fn.needs_history = needs_history
+        fn.needs_dense = needs_dense
         return fn
     return decorate
 
@@ -366,6 +405,15 @@ def build_din(rows: int, n_fields: int, embed_dim: int, pad_id: int, **kw):
     return DIN(rows, n_fields, pad_id=pad_id, embed_dim=embed_dim)
 
 
+@architecture(needs_dense=True)
+def build_dense_deepfm(rows: int, n_fields: int, embed_dim: int, pad_id: int,
+                       num_dense: int = 0, **kw):
+    if not num_dense:
+        raise ValueError("dense_deepfm needs the causal dense features; the "
+                         "trainer did not supply any")
+    return DenseDeepFM(rows, n_fields, num_dense, embed_dim=embed_dim)
+
+
 #: Architectures trainable by ``train_torch``. Add an entry and it becomes
 #: selectable as ``--model <key>`` immediately — no parser list to update and no
 #: dispatch chain to edit. Builders take ``(rows, n_fields, embed_dim, pad_id)``
@@ -374,6 +422,7 @@ MODELS = {
     'fm_torch': build_fm_torch,
     'deepfm': build_deepfm,
     'din': build_din,
+    'dense_deepfm': build_dense_deepfm,
 }
 
 

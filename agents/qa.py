@@ -102,6 +102,8 @@ class QAAgent(Agent):
         if spec.checkpoint is None:
             problems.append("no --model, so no checkpoint would be produced")
 
+        problems.extend(self._inert_flags(spec))
+
         # The hypothesis and the command must plausibly agree. This is a shallow
         # check, but it catches the drift mode that produced a log claiming DCN-v2
         # while running MMoE.
@@ -109,6 +111,62 @@ class QAAgent(Agent):
             problems.append("hypothesis does not mention the model the command runs")
 
         return PreflightVerdict(ok=not problems, problems=problems)
+
+    #: Flags each trainer silently ignores. ``fm`` (numpy) and ``lgb``
+    #: (LightGBM) have their own trainers; ``mmoe`` has no sequence input.
+    IGNORED_FLAGS = {
+        "fm": {"loss", "max_seq_len", "embed_dim", "experts", "expert_dim",
+               "aux_weight", "trees", "num_leaves", "objective"},
+        "lgb": {"loss", "max_seq_len", "embed_dim", "experts", "expert_dim",
+                "aux_weight", "epochs", "batch_size"},
+        "mmoe": {"max_seq_len", "trees", "num_leaves", "objective"},
+        "fm_torch": {"experts", "expert_dim", "aux_weight", "max_seq_len",
+                     "trees", "num_leaves", "objective"},
+        "deepfm": {"experts", "expert_dim", "aux_weight", "max_seq_len",
+                   "trees", "num_leaves", "objective"},
+        "din": {"experts", "expert_dim", "aux_weight", "trees", "num_leaves",
+                "objective"},
+    }
+
+    #: Words in a hypothesis that indicate it rests on a particular flag.
+    _FLAG_WORDS = {
+        "max_seq_len": ("sequence length", "seq len", "sequence len",
+                        "history length", "max_seq_len"),
+        "loss": ("loss", "objective"),
+        "experts": ("expert",),
+        "expert_dim": ("expert",),
+        "aux_weight": ("auxiliary", "aux weight"),
+        "embed_dim": ("embedding dim", "embedding size", "embed_dim", "capacity"),
+        "trees": ("tree", "boosting round"),
+        "num_leaves": ("leaves", "leaf"),
+    }
+
+    @classmethod
+    def _inert_flags(cls, spec: TrialSpec) -> List[str]:
+        """Reject a hypothesis whose mechanism rests on a flag the model ignores.
+
+        The winning row of a real run read "increasing the maximum sequence
+        length to 10 with a different model (mmoe) might better capture user
+        behavior patterns" — but ``train_mmoe`` never receives ``max_seq_len``.
+        It won because it ran MMoE, and the log recorded a reason the code
+        contradicts. Naming the model correctly is not enough: the *knob the
+        hypothesis is about* has to actually reach the trainer.
+        """
+        flags = parse_flags(spec.args)
+        model = flags.get("model")
+        if not model:
+            return []
+        text = f"{spec.hypothesis} {spec.mechanism}".lower()
+        out: List[str] = []
+        for flag in cls.IGNORED_FLAGS.get(model, ()):
+            if flag not in flags:
+                continue
+            if any(w in text for w in cls._FLAG_WORDS.get(flag, ())):
+                out.append(
+                    f"the hypothesis rests on --{flag}, but {model!r} ignores it "
+                    f"entirely, so any result would be attributed to a change "
+                    f"that never reached the trainer")
+        return out
 
     #: Words that plausibly describe each model.
     MODEL_ALIASES = {

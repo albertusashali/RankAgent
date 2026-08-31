@@ -28,7 +28,11 @@ from pipeline.features import (encode_features, extract_dense_tabular_features,
                                extract_sequential_features)
 
 HEADER = ['row_id', 'user_id', 'video_id', 'score']
-CHECKPOINTS_DIR = "checkpoints"
+# Must agree with pipeline.train, which reads the same variable. It previously
+# only matched because the orchestrator runs the export with cwd set to the
+# node's workspace, so the relative path happened to resolve there — which meant
+# running the export by hand silently looked in the wrong directory.
+CHECKPOINTS_DIR = os.environ.get("RANKAGENT_CHECKPOINTS", "checkpoints")
 SUBMISSIONS_DIR = "submissions"
 
 
@@ -124,7 +128,14 @@ def predict_split(name: str, splits: Dict[str, List[dict]], split: str) -> np.nd
 
     if arch == 'lgb':
         import lightgbm as lgb
-        dense, _names = extract_dense_tabular_features(splits)
+        # Rebuild the feature matrix from the recipe the checkpoint was trained
+        # on, not the current default. A model trained under a 15-feature recipe
+        # scored against the 28-feature default is a different model.
+        recipe = None
+        if meta.get("feature_recipe"):
+            from pipeline.feature_recipes import FeatureRecipe
+            recipe = FeatureRecipe.model_validate(meta["feature_recipe"])
+        dense, _names = extract_dense_tabular_features(splits, recipe=recipe)
         X = dense[split][0]
         booster = lgb.Booster(model_file=os.path.join(CHECKPOINTS_DIR, "lgb.txt"))
         return np.asarray(booster.predict(X), dtype=np.float64)
@@ -146,6 +157,9 @@ def predict_split(name: str, splits: Dict[str, List[dict]], split: str) -> np.nd
     dim = meta.get("embed_dim", 16)
     n_fields = len(encoder.field_names)
     hist = None
+    # Initialised here, not inside the else-branch: it is read after the
+    # if/else, and MMoE takes the other path.
+    needs_dense = False
 
     if arch == 'mmoe':
         # MMoE has its own trainer (multiple heads, auxiliary tasks), so it is
@@ -162,16 +176,36 @@ def predict_split(name: str, splits: Dict[str, List[dict]], split: str) -> np.nd
         # submission time — the one moment there is no chance to recover.
         builder = resolve_model(arch)
         needs_hist = getattr(builder, 'needs_history', False)
+        needs_dense = getattr(builder, 'needs_dense', False)
         if needs_hist:
             seqs = extract_sequential_features(
                 splits, encoder, max_seq_len=meta.get("max_seq_len", 10))
             hist = seqs[split]
+        if needs_dense:
+            # Rebuild with the recipe TRAINING used. A dense model restored
+            # against a different feature set has the wrong first-layer width,
+            # and if the widths happen to agree it silently scores the wrong
+            # columns — which is worse.
+            recipe = None
+            if meta.get("feature_recipe"):
+                from pipeline.feature_recipes import FeatureRecipe
+                recipe = FeatureRecipe.model_validate(meta["feature_recipe"])
+            dense, _ = extract_dense_tabular_features(splits, recipe=recipe)
+            hist = dense[split][0]
+            trained_dim = meta.get("num_dense")
+            if trained_dim and hist.shape[1] != trained_dim:
+                raise ValueError(
+                    f"{name} was trained on {trained_dim} dense features but the "
+                    f"current configuration produces {hist.shape[1]}. The recipe "
+                    f"recorded in the checkpoint metadata no longer reproduces "
+                    f"the same feature set.")
         rows = encoder.embedding_rows if needs_hist else encoder.total_dim
-        model = builder(rows, n_fields, dim, encoder.pad_id)
+        model = builder(rows, n_fields, dim, encoder.pad_id,
+                        num_dense=meta.get("num_dense", 0))
 
     ckpt = os.path.join(CHECKPOINTS_DIR, f"{name}.pt")
     model.load_state_dict(torch.load(ckpt, map_location='cpu'))
-    return _predict_torch(model.to(DEVICE), X, hist)
+    return _predict_torch(model.to(DEVICE), X, hist, side_is_long=not needs_dense)
 
 
 def prediction_cache_path(name: str, split: str) -> str:

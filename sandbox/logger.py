@@ -114,6 +114,10 @@ class RunLogger:
         if entry.rationale:
             out.append(f"**Rationale.** {entry.rationale}\n\n")
         out.append(f"- Proposal source: `{entry.proposal_source}`\n")
+        if entry.method_id and entry.method_id != "novel":
+            out.append(f"- Method: **{entry.method_id}** — {entry.citation}\n")
+        elif entry.citation:
+            out.append(f"- Method: {entry.citation}\n")
         out.append(f"- Target file: `{entry.target_file}`\n")
         out.append(f"- Command: `{entry.command}`\n")
         if entry.metrics:
@@ -177,5 +181,31 @@ class RunLogger:
         ]
         md = ["## Run summary\n\n", "| | |\n|---|---|\n"]
         md += [f"| {k} | {v} |\n" for k, v in rows]
+
+        bc = (summary.autonomy or {}).get("best_code_authored")
+        if bc:
+            md.append(
+                f"\n**Best result from agent-written code:** {bc['primary']:.4f} "
+                f"at iteration {bc['iteration']} (`{bc['target_file']}`)"
+                + (" — also the overall best.\n"
+                   if bc.get("is_overall_best")
+                   else ". The overall best was a configuration-only trial.\n"))
+
+        # A bibliography of the run, generated from the ids the Researcher chose.
+        # Citations are looked up from a fixed table, never written by the model,
+        # so nothing here can be a fabricated reference.
+        cited = {}
+        for e in self.entries:
+            mid = e.get("method_id")
+            if mid and mid != "novel" and e.get("citation"):
+                cited.setdefault(mid, (e["citation"], []))[1].append(e["iteration_id"])
+        if cited:
+            md.append("\n## References\n\nMethods this run drew on, and the "
+                      "iterations that tested them.\n\n")
+            for mid, (citation, its) in sorted(cited.items()):
+                md.append(f"- **{mid}** — {citation} "
+                          f"(iteration{'s' if len(its) > 1 else ''} "
+                          f"{', '.join(str(i) for i in its)})\n")
+
         md.append(f"\n> Archived copy of this run: `{self.archive_json}`\n")
         self._append_md("".join(md))

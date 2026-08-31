@@ -297,3 +297,89 @@ def test_group_padded_regroups_a_ragged_batch():
     # Degenerate shapes must not crash: one group, and one row.
     solo, solo_mask = group_padded(torch.tensor([5.]), torch.tensor([0]), 1)
     assert solo.tolist() == [[5.0]] and solo_mask.tolist() == [[True]]
+
+
+def test_neutral_code_stays_eligible_to_build_on():
+    """Improvements must compound, or a long run buys nothing over a short one.
+
+    `select_parent` used to return the global best, so a node became a parent
+    only by beating everything before it. Generated code rarely wins first time,
+    so nothing became a parent and every node restarted from the unmodified
+    baseline. One 30-iteration run wrote 275 lines across eight patches and
+    submitted a model carrying none of them.
+    """
+    from orchestrator.schemas import MetricResult
+    from orchestrator.tree_manager import TreeManager
+
+    def m(p):
+        return MetricResult(gauc=p, ndcg_5=p, primary_score=p, delta_from_baseline=0.0)
+
+    t = TreeManager(epsilon=0.002, n_convergence=3, max_iterations=30)
+    t.record_baseline(0.6015)
+
+    # Two changes that land inside seed noise — the real DCN-v2 / PLE results.
+    t.add_node(1, t.select_parent(), "dcn_v2", "models.py", m(0.6011))
+    assert t.select_parent() == 1, "a result within 3 sigma of the best must stay buildable on"
+
+    t.add_node(2, t.select_parent(), "ple", "models.py", m(0.6001))
+    assert t.select_parent() == 2
+    assert t.nodes[2]["depth"] == 2, "depth must accumulate so work compounds"
+
+    # A genuinely broken result is not inherited.
+    t.add_node(3, t.select_parent(), "broken", "models.py", m(0.50))
+    assert t.select_parent() != 3
+
+    # Submission selection is untouched — still a strict argmax on validation.
+    assert t.best_node_id == 0 and t.best_primary_score == pytest.approx(0.6015)
+
+
+def test_a_hypothesis_resting_on_an_ignored_flag_is_blocked():
+    """The winning row of a real run claimed a mechanism the code contradicts.
+
+    It read "increasing the maximum sequence length to 10 with a different model
+    (mmoe)" — but `train_mmoe` never receives `max_seq_len`. It won because it
+    ran MMoE. Naming the model correctly is not enough; the knob the hypothesis
+    is about has to actually reach the trainer.
+    """
+    from agents.engineer import TrialSpec, checkpoint_name
+    from agents.qa import QAAgent
+
+    def spec(args, hyp):
+        return TrialSpec(dimension="sequence", source="llm", hypothesis=hyp,
+                         args=args, command="x", checkpoint=checkpoint_name(args))
+
+    qa = QAAgent()
+    assert qa._inert_flags(spec(
+        "--model=mmoe --loss=pointwise --max_seq_len=10",
+        "Increasing the maximum sequence length to 10 with a different model (mmoe)"))
+    assert qa._inert_flags(spec(
+        "--model=fm --loss=focal", "Implement focal loss to down-weight easy negatives"))
+
+    # Legitimate pairings must still pass, and a flag merely *present* without
+    # the hypothesis resting on it is not a problem.
+    assert not qa._inert_flags(spec(
+        "--model=din --loss=pointwise --max_seq_len=20",
+        "Increasing the maximum sequence length on DIN to capture more history"))
+    assert not qa._inert_flags(spec(
+        "--model=mmoe --loss=listwise --experts=8", "Widen the MMoE expert pool"))
+    assert not qa._inert_flags(spec(
+        "--model=mmoe --loss=pointwise --max_seq_len=10",
+        "Train long_view jointly with click and like through MMoE gating"))
+
+
+def test_a_citation_cannot_be_fabricated():
+    """The model picks an id from a closed set; it never types a reference."""
+    from agents.knowledge import KB, citation_for
+    from agents.researcher import Hypothesis
+
+    h = Hypothesis(dimension="loss", hypothesis="Implement the ApproxNDCG surrogate",
+                   args="--model fm_torch", source="llm", method_id="approx_ndcg")
+    assert h.method_id == "approx_ndcg"
+    assert "Qin" in citation_for(h.method_id)
+
+    invented = Hypothesis(dimension="loss", hypothesis="Implement my invented method",
+                          args="--model fm_torch", source="llm",
+                          method_id="Smith et al. (2024), fabricated")
+    assert invented.method_id == "novel"
+    assert "no published reference" in citation_for(invented.method_id)
+    assert all(m.citation and m.why_here for m in KB.values())
