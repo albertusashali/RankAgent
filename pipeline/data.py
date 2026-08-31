@@ -47,26 +47,53 @@ VID_FE = ['author_id', 'music_id', 'video_type', 'upload_type']
 
 LOG_FILES = ('log_standard_4_08_to_4_21_pure.csv', 'log_standard_4_22_to_5_08_pure.csv')
 
-_CANDIDATE_DIRS = [
-    "./data/KuaiRand-Pure/data",
-    "./kuairand-starter-kit/KuaiRand-Pure/data",
-    "./KuaiRand-Pure/data",
-    "./data/KuaiRand-Pure/KuaiRand-Pure/data",
-    "../data/KuaiRand-Pure/data",
-    "./data",
+_CANDIDATE_SUBPATHS = [
+    "data/KuaiRand-Pure/data",
+    "data/KuaiRand-Pure/KuaiRand-Pure/data",
+    "kuairand-starter-kit/KuaiRand-Pure/data",
+    "KuaiRand-Pure/data",
+    "data",
 ]
 
 
 def find_data_dir(data_dir: Optional[str] = None) -> str:
     """Resolve the KuaiRand-Pure data directory, or explain where to get it."""
+    if data_dir and os.path.exists(os.path.join(data_dir, LOG_FILES[0])):
+        return os.path.abspath(data_dir)
+
     candidates = [data_dir] if data_dir else []
-    candidates += _CANDIDATE_DIRS
-    for d in candidates:
-        if d and os.path.exists(os.path.join(d, LOG_FILES[0])):
-            return d
+
+    # Search from current working directory and up to 4 parent levels
+    search_roots = []
+    curr = os.path.abspath(os.getcwd())
+    for _ in range(5):
+        search_roots.append(curr)
+        parent = os.path.dirname(curr)
+        if parent == curr:
+            break
+        curr = parent
+
+    # Also search from the directory containing this data.py file and its parents
+    curr = os.path.abspath(os.path.dirname(__file__))
+    for _ in range(5):
+        if curr not in search_roots:
+            search_roots.append(curr)
+        parent = os.path.dirname(curr)
+        if parent == curr:
+            break
+        curr = parent
+
+    for root in search_roots:
+        for sub in _CANDIDATE_SUBPATHS:
+            cand = os.path.normpath(os.path.join(root, sub))
+            if cand not in candidates:
+                candidates.append(cand)
+            if os.path.exists(os.path.join(cand, LOG_FILES[0])):
+                return cand
+
     raise FileNotFoundError(
         "KuaiRand-Pure data not found. Looked in:\n  "
-        + "\n  ".join(str(c) for c in candidates)
+        + "\n  ".join(str(c) for c in candidates[:10])
         + "\n\nFetch it with `make data`, or:\n"
           "  mkdir -p data && cd data\n"
           "  curl -L -O https://zenodo.org/records/10439422/files/KuaiRand-Pure.tar.gz\n"

@@ -32,6 +32,7 @@ from orchestrator.tree_manager import BASELINE_VAL_PRIMARY, TreeManager
 from sandbox.debugger import SelfHealingDebugger
 from sandbox.logger import RunLogger
 from sandbox.runner import ExecutionRunner
+from pipeline.data import find_data_dir
 
 PY = sys.executable
 CONFIG_DIR = "configs"
@@ -173,7 +174,17 @@ class RankAgentOrchestrator:
         bench_cfg = load_yaml("benchmark_kuairand.yaml")
         conv = (bench_cfg.get("convergence") or {})
 
-        self.data_dir = data_dir
+        if data_dir is not None:
+            try:
+                self.data_dir = os.path.abspath(find_data_dir(data_dir))
+            except Exception:
+                self.data_dir = data_dir
+        else:
+            try:
+                self.data_dir = os.path.abspath(find_data_dir())
+            except Exception:
+                self.data_dir = None
+
         self.run_baseline_flag = run_baseline
         #: Whether this run actually re-ran the baseline, or merely asserted it.
         self.baseline_reproduced = False
@@ -202,7 +213,7 @@ class RankAgentOrchestrator:
         self.logger = RunLogger(run_id=run_id)
 
         self.tokens = TokenUsage()
-        self.team = AgentTeam(self.tokens, data_dir=data_dir,
+        self.team = AgentTeam(self.tokens, data_dir=self.data_dir,
                               pm_refresh=int(agent_cfg.get("agent", {}).get("pm_refresh", 3)),
                               proposals=int(agent_cfg.get("agent", {}).get("proposals_per_call", 3)),
                               max_retries=int(dbg_cfg.get("max_self_healing_attempts", 3)))

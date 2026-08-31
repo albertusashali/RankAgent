@@ -55,6 +55,7 @@ class TrainResult(dict):
 
 
 def _save_meta(name: str, meta: dict):
+    os.makedirs(CHECKPOINTS_DIR, exist_ok=True)
     with open(os.path.join(CHECKPOINTS_DIR, f"{name}.meta.json"), "w") as fh:
         json.dump(meta, fh, indent=2)
 
@@ -166,6 +167,7 @@ def train_numpy_fm(splits: Dict, k: int = 16, lr: float = 0.001, epochs: int = 4
                 break
 
     m.V, m.W, m.b = best_state
+    os.makedirs(CHECKPOINTS_DIR, exist_ok=True)
     np.savez_compressed(os.path.join(CHECKPOINTS_DIR, "fm.npz"), V=m.V, W=m.W, b=m.b)
     return _finish("fm", evaluate(uva, yva, m.predict(Xva)),
                    {"model": "fm", "k": k, "lr": lr, "seed": seed, "use_cwm": use_cwm})
@@ -292,6 +294,7 @@ def train_torch(splits: Dict, arch: str = 'fm_torch', loss: str = 'listwise',
 
     model.load_state_dict(best_state)
     name = f"{arch}_{loss}"
+    os.makedirs(CHECKPOINTS_DIR, exist_ok=True)
     torch.save(best_state, os.path.join(CHECKPOINTS_DIR, f"{name}.pt"))
     return _finish(name, evaluate(uva, yva, _predict_torch(model.to(DEVICE), Xva, side_va,
                                                     side_is_long=side_is_long)),
@@ -388,6 +391,7 @@ def train_mmoe(splits: Dict, embed_dim: int = 16, num_experts: int = 4,
                 break
 
     model.load_state_dict(best_state)
+    os.makedirs(CHECKPOINTS_DIR, exist_ok=True)
     torch.save(best_state, os.path.join(CHECKPOINTS_DIR, "mmoe.pt"))
     return _finish("mmoe", evaluate(uva, yva, _predict_torch(model.to(DEVICE), Xva)),
                    {"model": "mmoe", "loss": loss, "embed_dim": embed_dim,
@@ -457,6 +461,7 @@ def train_lightgbm(splits: Dict, num_trees: int = 400, lr: float = 0.05,
         print(f"==> lightgbm[{objective}] {time.time()-t0:.1f}s, "
               f"best iteration {booster.best_iteration}")
 
+    os.makedirs(CHECKPOINTS_DIR, exist_ok=True)
     booster.save_model(os.path.join(CHECKPOINTS_DIR, "lgb.txt"))
     va_preds = booster.predict(Xva_s, num_iteration=booster.best_iteration)
     return _finish("lgb", evaluate(uva_s, yva_s, va_preds),

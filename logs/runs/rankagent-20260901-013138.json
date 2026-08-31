@@ -1,0 +1,49 @@
+{
+  "run_id": "rankagent-20260901-013138",
+  "benchmark": "KuaiRand-Pure",
+  "baseline_valid_primary": 0.6016,
+  "baseline_reproduced": false,
+  "best_valid_primary": null,
+  "best_delta": null,
+  "best_iteration": null,
+  "iterations_used": 0,
+  "iteration_cap": 1,
+  "halt_reason": "baseline reproduction failed",
+  "wall_clock_seconds": 99.87902474403381,
+  "total_prompt_tokens": 0,
+  "total_completion_tokens": 0,
+  "llm_calls": 0,
+  "manual_interventions": 1,
+  "error_recoveries": 0,
+  "failed_iterations": 0,
+  "submission_path": null,
+  "baseline_measured": null,
+  "baseline_drift": null,
+  "submission_decision": {},
+  "interventions": [
+    {
+      "kind": "cli:--max-iterations",
+      "severity": "config",
+      "detail": "operator set --max-iterations=1 (default None)",
+      "iteration": null,
+      "at": 1788197500.0864189
+    }
+  ],
+  "autonomy": {
+    "llm_available": true,
+    "iterations_total": 0,
+    "recipe_trials": 0,
+    "distinct_recipes": 0,
+    "best_code_authored": null,
+    "iterations_llm_authored": 0,
+    "iterations_from_playbook": 0,
+    "nodes_with_generated_code": 0,
+    "generated_lines_added": 0,
+    "best_node_source": null,
+    "best_node_had_code_change": false,
+    "note": "0/0 iterations were authored by the model; 0 applied a code patch."
+  },
+  "cost_by_agent": {},
+  "iterations": [],
+  "total_tokens": 0
+}

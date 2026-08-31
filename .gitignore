@@ -53,6 +53,8 @@ workspace/
 # mutable pipeline source. They are run artifacts — the diffs that matter are
 # recorded in the run log, not here.
 workspaces/
+workspaces_smoke/
+sandbox_*/
 temp/
 tmp/
 *.log
