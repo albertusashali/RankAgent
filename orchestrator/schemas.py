@@ -53,6 +53,8 @@ class HypothesisProposal(BaseModel):
     stage: str
     hypothesis: str
     rationale: str = ""
+    detailed_reasoning: str = ""
+    postmortem_diagnosis: str = ""
     target_file: str = "pipeline/train.py"
     command: str
     source: Literal["llm", "fallback", "repair"] = "llm"
@@ -65,6 +67,8 @@ class IterationLogEntry(BaseModel):
     stage: str
     hypothesis: str
     rationale: str = ""
+    detailed_reasoning: str = ""
+    postmortem_diagnosis: str = ""
     target_file: str
     command: str
     proposal_source: str = "llm"

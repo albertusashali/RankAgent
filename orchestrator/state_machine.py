@@ -236,11 +236,33 @@ class RankAgentOrchestrator:
         for strat in STRATEGY_BANK:
             if strat["command"] not in self._used_commands:
                 return HypothesisProposal(source="fallback", rationale="deterministic plan",
-                                          **strat)
+                                          detailed_reasoning=(f"Run `{strat['command']}` against the validation split. "
+                                              "This tests the stated hypothesis while holding other choices "
+                                              "fixed; compare primary score and delta with the current best."),
+                                          postmortem_diagnosis=self._previous_postmortem(iteration_id), **strat)
         strat = STRATEGY_BANK[(iteration_id - 1) % len(STRATEGY_BANK)]
         return HypothesisProposal(source="fallback",
                                   rationale="plan exhausted; repeating with a new seed",
+                                  detailed_reasoning=(f"Repeat the plan with seed {iteration_id} to measure "
+                                      "seed sensitivity before drawing a conclusion."),
+                                  postmortem_diagnosis=self._previous_postmortem(iteration_id),
                                   **{**strat, "command": f"{strat['command']} --seed {iteration_id}"})
+
+    def _previous_postmortem(self, iteration_id: int) -> str:
+        """Explain the prior outcome using observed evidence only."""
+        if iteration_id <= 1:
+            return "N/A (no previous iteration)"
+        previous = self.tree.nodes.get(iteration_id - 1)
+        if not previous:
+            return f"Iteration {iteration_id - 1} has no recorded outcome."
+        if previous.get("status") == "FAILED":
+            return (f"Iteration {iteration_id - 1} failed before producing validation metrics; "
+                    "the experiment was not evaluable and was pruned.")
+        if previous.get("status") == "REJECTED":
+            return (f"Iteration {iteration_id - 1} produced metrics but was rejected because its "
+                    f"primary score ({previous['primary']:.4f}) did not beat the best score at that point.")
+        return (f"Iteration {iteration_id - 1} completed successfully; no failure was recorded. "
+                "Use its result as the current comparison point.")
 
     def _client_or_none(self):
         if self._client is not None:
@@ -310,6 +332,11 @@ class RankAgentOrchestrator:
                 stage=str(data.get("stage", "Unspecified")),
                 hypothesis=str(data["hypothesis"]),
                 rationale=str(data.get("rationale", "")),
+                detailed_reasoning=str(data.get("detailed_reasoning", "")),
+                # Keep this evidence-based: the model may explain the next
+                # experiment, but only observed tree state can diagnose the
+                # preceding iteration.
+                postmortem_diagnosis=self._previous_postmortem(iteration_id),
                 target_file=str(data.get("target_file", "pipeline/train.py")),
                 command=cmd, source="llm")
         except Exception as exc:
@@ -398,6 +425,8 @@ class RankAgentOrchestrator:
             iteration_id=iteration_id, node_id=iteration_id, parent_node_id=parent,
             stage=proposal.stage, hypothesis=proposal.hypothesis,
             rationale=proposal.rationale, target_file=proposal.target_file,
+            detailed_reasoning=proposal.detailed_reasoning,
+            postmortem_diagnosis=proposal.postmortem_diagnosis or self._previous_postmortem(iteration_id),
             command=command, proposal_source=proposal.source,
             code_diff=self.logger.capture_diff(),
             status=status, metrics=metrics.model_dump() if metrics else None,
