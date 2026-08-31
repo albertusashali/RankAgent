@@ -31,6 +31,7 @@ from sandbox.runner import ExecutionRunner
 
 PY = sys.executable
 CONFIG_DIR = "configs"
+MAX_PROPOSAL_ATTEMPTS = 5
 
 
 def load_dotenv_if_present(path: str = ".env"):
@@ -194,6 +195,22 @@ class RankAgentOrchestrator:
             return f"{cmd} --data_dir {self.data_dir}"
         return cmd
 
+    @staticmethod
+    def _normalize_command(command: str) -> str:
+        """Normalize harmless whitespace differences before duplicate checks."""
+        return " ".join(command.split())
+
+    def _proposal_is_duplicate(self, proposal: HypothesisProposal) -> bool:
+        """Reject repeated experiments even when the LLM changes its wording."""
+        command = self._normalize_command(self._with_data_dir(proposal.command))
+        if command in self._used_commands:
+            return True
+        return any(
+            entry.get("hypothesis", "").strip().casefold()
+            == proposal.hypothesis.strip().casefold()
+            for entry in self.logger.entries
+        )
+
     # -- phase 0 -----------------------------------------------------------
 
     def run_baseline(self) -> bool:
@@ -354,9 +371,20 @@ class RankAgentOrchestrator:
     def run_iteration(self, iteration_id: int) -> bool:
         """Execute one hypothesis. Returns whether the run should halt."""
         print(f"\n{'=' * 74}\n>>> ITERATION {iteration_id}/{self.max_iterations}\n{'=' * 74}")
-        proposal = self.propose(iteration_id)
-        command = self._with_data_dir(proposal.command)
-        self._used_commands.add(proposal.command)
+        proposal = None
+        command = ""
+        for attempt in range(1, MAX_PROPOSAL_ATTEMPTS + 1):
+            candidate = self.propose(iteration_id)
+            if not self._proposal_is_duplicate(candidate):
+                proposal = candidate
+                command = self._with_data_dir(candidate.command)
+                break
+            print(f"  [WARN] duplicate proposal; retrying ({attempt}/{MAX_PROPOSAL_ATTEMPTS})")
+        if proposal is None:
+            print(f"  [ERROR] could not produce a unique proposal for iteration {iteration_id}")
+            self.failed_iterations += 1
+            return False
+        self._used_commands.add(self._normalize_command(command))
 
         print(f"  Stage      : {proposal.stage}  [{proposal.source}]")
         print(f"  Hypothesis : {proposal.hypothesis}")
