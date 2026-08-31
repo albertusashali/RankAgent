@@ -157,11 +157,27 @@ def test_convergence_tracks_the_best_so_far_curve():
         t.add_node(i, 0, "h", "f", m(p))
     assert t.best_primary_score == pytest.approx(0.6030), "small improvements were discarded"
 
-    # A flat stretch of three iterations converges.
+    # A flat stretch converges — but only once the run has had a fair chance.
     t2 = TreeManager(epsilon=0.002, n_convergence=3, max_iterations=50)
     t2.record_baseline(0.6000)
     conv = [t2.add_node(i, 0, "h", "f", m(0.6001)) for i in range(1, 5)]
-    assert conv[-1] is True
+    assert not any(conv), (
+        "convergence fired on the 4th trial of a 50-iteration budget. On this "
+        "benchmark total headroom is ~0.003, so 'no 0.002 jump in three tries' "
+        "is the normal case rather than evidence the search is exhausted.")
+
+    flat = [t2.add_node(i, 0, "h", "f", m(0.6001)) for i in range(5, 12)]
+    assert any(flat), "a genuinely flat run must still converge"
+    assert "improved by <=" in (t2.halt_reason or ""), (
+        "the organizers' eps/N rule must remain the reported criterion")
+
+
+def test_convergence_floor_never_exceeds_half_the_budget():
+    """A short run must still be able to converge rather than always capping."""
+    from orchestrator.tree_manager import TreeManager
+    for cap in (2, 4, 6, 10, 50):
+        t = TreeManager(epsilon=0.002, n_convergence=3, max_iterations=cap)
+        assert t.min_iterations <= max(1, cap // 2), cap
 
 
 def test_failed_iterations_do_not_count_as_convergence():
@@ -306,8 +322,77 @@ def test_summary_records_whether_the_baseline_was_verified():
     assert RunSummary(run_id="x", baseline_reproduced=True).baseline_reproduced is True
 
 
-def test_captured_diff_excludes_agent_artifacts():
-    """code_diff must describe source changes, not the log recording itself."""
-    from sandbox.logger import RunLogger
-    for path in ("logs", "submissions", "checkpoints", "data"):
-        assert path in RunLogger.DIFF_EXCLUDES
+def test_code_diff_reports_only_what_actually_changed():
+    """`code_diff` must be a fact about the files, not about the repository.
+
+    It used to be `git diff` over the working tree, so every archived iteration
+    logged whatever happened to be uncommitted — an unrelated README edit — in a
+    field that claims to show the change the agent applied. The diff is now
+    computed from the mutable sources before and after the patch.
+    """
+    from sandbox.workspace import unified_diff
+
+    before = {"pipeline/models.py": "a = 1\nb = 2\n",
+              "pipeline/features.py": "unchanged\n"}
+    after = {"pipeline/models.py": "a = 1\nb = 3\nc = 4\n",
+             "pipeline/features.py": "unchanged\n"}
+
+    diff, (files, added, removed) = unified_diff(before, after)
+    assert files == 1 and added == 2 and removed == 1
+    assert "pipeline/models.py" in diff
+    assert "features.py" not in diff, "an untouched file must not appear"
+    assert "+c = 4" in diff
+
+    empty, stat = unified_diff(before, before)
+    assert empty == "" and stat == (0, 0, 0)
+
+
+def test_generated_code_cannot_reach_the_hidden_test_labels():
+    """The leak gate must block the plausible mistake, not just the obvious one.
+
+    `long_view` is close to a deterministic function of play_time/duration, so a
+    `watch_ratio` feature scores brilliantly on validation and is meaningless on
+    the hidden test split, where play_time_ms is withheld.
+    """
+    from sandbox.verifier import verify_source
+
+    leaks = [
+        "def featurise(row):\n    return [row['play_time_ms'] / row['duration_ms']]",
+        "def featurise(row):\n    return [row.get('play_time_ms', 0.0)]",
+        "from pipeline.data import load_test_labels\ndef f():\n    return load_test_labels()",
+        "import os\nos.environ['RANKAGENT_UNSEAL_TEST'] = '1'",
+        "def f(splits):\n    return splits['test']",
+    ]
+    for src in leaks:
+        found = verify_source("pipeline/features.py", src)
+        assert any(f.fatal for f in found), f"leak not blocked:\n{src}"
+
+    # Pre-impression context is knowable at ranking time and must stay allowed.
+    ok = verify_source("pipeline/features.py",
+                       "def featurise(row):\n"
+                       "    return [row['duration_ms'], row['tab'], row['is_rand']]")
+    assert ok == [], f"false positive on safe features: {[str(f) for f in ok]}"
+
+
+def test_the_shipped_pipeline_passes_its_own_leak_gate():
+    """A gate that flags the baseline would block every legitimate patch."""
+    from sandbox.verifier import verify_source
+    from sandbox.workspace import MUTABLE
+
+    for rel in MUTABLE:
+        with open(rel, encoding="utf-8") as fh:
+            found = verify_source(rel, fh.read())
+        assert found == [], f"{rel}: {[str(f) for f in found]}"
+
+
+def test_play_time_is_withheld_on_the_hidden_split():
+    """The seal covers post-impression outcomes, not just the label."""
+    from pipeline.data import WITHHELD
+    import inspect
+    import pipeline.data as data
+
+    src = inspect.getsource(data.load_kuairand)
+    assert "'play_time_ms': float(WITHHELD) if is_test" in src, (
+        "play_time_ms must be withheld on the test split: long_view is ~98% "
+        "determined by play_time/duration, so exposing it hands out the label")
+    assert WITHHELD == -1

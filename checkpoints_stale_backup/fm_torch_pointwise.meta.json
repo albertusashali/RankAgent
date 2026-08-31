@@ -1,0 +1,9 @@
+{
+  "model": "fm_torch",
+  "loss": "pointwise",
+  "embed_dim": 16,
+  "lr": 0.001,
+  "seed": 0,
+  "use_cwm": false,
+  "max_seq_len": 10
+}

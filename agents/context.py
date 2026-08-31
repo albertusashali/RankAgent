@@ -131,6 +131,14 @@ class ResearchContext:
     directive: Optional[Any] = None          # set by the Product Manager agent
     seed_noise: float = 0.0008               # published std over 5 seeds
 
+    #: Human-readable description of the code the current node starts from, e.g.
+    #: "baseline + listwise softmax loss + user x author cross". Because each
+    #: workspace is copied from its parent, edits compose, and the agents have to
+    #: be told what is already applied or they will propose it again.
+    lineage: str = "baseline (unmodified pipeline)"
+    #: Accumulated edit labels, one per accepted code change, building `lineage`.
+    edits_applied: List[str] = field(default_factory=list)
+
     # -- budget -----------------------------------------------------------
 
     @property
@@ -166,6 +174,53 @@ class ResearchContext:
 
     def unexplored_dimensions(self) -> List[str]:
         return [d for d, n in self.dimension_counts().items() if n == 0]
+
+    # -- failure history --------------------------------------------------
+    #
+    # `error_kind` was previously recorded on every failed trial and read by
+    # nothing: no agent saw it, so five consecutive crashes of the same kind
+    # looked exactly like five unrelated ones and nothing ever changed course.
+    # These three helpers are what turn "retry the same thing" into "route
+    # around it", which is the behaviour the brief actually asks for.
+
+    def consecutive_failures(self) -> int:
+        n = 0
+        for t in reversed(self.trials):
+            if t.succeeded:
+                break
+            n += 1
+        return n
+
+    def failing_dimensions(self, window: int = 3) -> List[str]:
+        """Dimensions whose last ``window`` trials all failed."""
+        out = []
+        for dim in DIMENSIONS:
+            recent = [t for t in self.trials if t.dimension == dim][-window:]
+            if len(recent) >= window and not any(t.succeeded for t in recent):
+                out.append(dim)
+        return out
+
+    def failure_report(self, limit: int = 5) -> str:
+        failures = [t for t in self.trials if not t.succeeded]
+        if not failures:
+            return "No experiment has failed yet."
+        kinds: Dict[str, int] = {}
+        for t in failures:
+            kinds[t.error_kind or "UNCLASSIFIED"] = kinds.get(t.error_kind or "UNCLASSIFIED", 0) + 1
+        lines = [f"{len(failures)} experiment(s) have failed. By kind: "
+                 + ", ".join(f"{k}={n}" for k, n in sorted(kinds.items()))]
+        run = self.consecutive_failures()
+        if run >= 2:
+            lines.append(f"WARNING: the last {run} experiments in a row failed. "
+                         f"Change approach rather than retrying a variation.")
+        blocked = self.failing_dimensions()
+        if blocked:
+            lines.append(f"These dimensions keep failing and should be avoided: "
+                         f"{', '.join(blocked)}.")
+        for t in failures[-limit:]:
+            lines.append(f"  iter {t.iteration} [{t.dimension}] "
+                         f"{t.error_kind or 'UNCLASSIFIED'}: `{t.signature}`")
+        return "\n".join(lines)
 
     def record(self, trial: TrialRecord):
         self.trials.append(trial)

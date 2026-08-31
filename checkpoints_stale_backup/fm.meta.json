@@ -1,0 +1,7 @@
+{
+  "model": "fm",
+  "k": 16,
+  "lr": 0.001,
+  "seed": 0,
+  "use_cwm": false
+}

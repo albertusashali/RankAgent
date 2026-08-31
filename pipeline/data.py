@@ -97,11 +97,20 @@ def load_kuairand(data_dir: Optional[str] = None,
     """Load interaction logs, split by date.
 
     Returns ``{'train': [...], 'valid': [...]}`` and, when ``include_test`` is
-    set, a ``'test'`` list whose rows carry features but ``label = WITHHELD``.
+    set, a ``'test'`` list whose rows carry features but no outcomes.
 
     Every row is a dict with the 5 base fields, the auxiliary feedback signals
-    (``click``/``like``/``follow``/``comment``/``forward``), ``play_time_ms`` and
-    ``duration_ms`` for watch-time modelling, and optional side features.
+    (``click``/``like``/``follow``/``comment``/``forward``), ``play_time_ms``
+    for watch-time modelling, ``duration_ms``, and optional side features.
+
+    **What "withheld" covers.** On the hidden test split, every *post-impression
+    outcome* is set to ``WITHHELD`` (-1): the six binary signals and
+    ``play_time_ms``. Pre-impression context — ``duration_ms``, ``tab``,
+    ``is_rand``, the ids and the side features — is exposed on every split,
+    because it is knowable at ranking time. The distinction matters:
+    ``long_view`` is close to a deterministic function of
+    ``play_time_ms / duration_ms``, so exposing watch time on the test split
+    would hand out the label.
     """
     actual_dir = find_data_dir(data_dir)
     vid2info, u2info = _read_side_features(actual_dir, include_extra_features)
@@ -141,9 +150,19 @@ def load_kuairand(data_dir: Optional[str] = None,
                     'video_id': video_id,
                     'author_id': vinfo[0],
                     'tab': r.get('tab', '1'),
+                    # duration_ms is a property of the video, known before the
+                    # impression, so it is safe to expose on every split.
                     'duration_ms': float(r.get('duration_ms', 0.0)),
-                    'play_time_ms': float(r.get('play_time_ms', 0.0)),
-                    # --- targets: withheld on the hidden test split ---
+                    # --- outcomes: withheld on the hidden test split ---
+                    # play_time_ms is a POST-impression outcome, not a feature.
+                    # long_view is ~98% determined by play_time/duration, so
+                    # leaving it unredacted here would let any feature derived
+                    # from it score near-perfectly on the hidden test while being
+                    # pure label leakage. It was previously passed through
+                    # ungated; nothing read it per-row, but that made it a
+                    # landmine rather than a safe omission.
+                    'play_time_ms': float(WITHHELD) if is_test
+                                    else float(r.get('play_time_ms', 0.0)),
                     'label':   WITHHELD if is_test else (1 if r.get(LABEL, '0') != '0' else 0),
                     'click':   WITHHELD if is_test else (1 if r.get('is_click', '0') != '0' else 0),
                     'like':    WITHHELD if is_test else (1 if r.get('is_like', '0') != '0' else 0),

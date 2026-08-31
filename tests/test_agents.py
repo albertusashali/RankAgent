@@ -121,7 +121,8 @@ def test_researcher_parse_drops_out_of_scope_hypotheses():
 
 def test_hypothesis_rejects_unknown_dimension():
     with pytest.raises(Exception):
-        Hypothesis(dimension="vibes", hypothesis="something long enough", args="--model fm")
+        Hypothesis(dimension="vibes", hypothesis="something long enough",
+                   args="--model fm", source="playbook")
 
 
 # --- engineer: validation is the anti-drift guarantee ----------------------
@@ -129,15 +130,15 @@ def test_hypothesis_rejects_unknown_dimension():
 def test_engineer_rejects_arguments_the_trainer_does_not_accept():
     c = ctx()
     h = Hypothesis(dimension="loss", hypothesis="test an invented flag",
-                   args="--model fm_torch --lambdarank_truncation 5")
+                   args="--model fm_torch --lambdarank_truncation 5", source="playbook")
     assert EngineerAgent().build(c, [h]) is None
 
 
 def test_engineer_falls_through_to_the_next_hypothesis():
     c = ctx()
-    bad = Hypothesis(dimension="loss", hypothesis="invalid model choice", args="--model dcnv2")
+    bad = Hypothesis(dimension="loss", hypothesis="invalid model choice", args="--model dcnv2", source="playbook")
     good = Hypothesis(dimension="loss", hypothesis="within-user listwise softmax",
-                      args="--model fm_torch --loss listwise")
+                      args="--model fm_torch --loss listwise", source="playbook")
     spec = EngineerAgent().build(c, [bad, good])
     assert spec is not None and spec.args == "--model fm_torch --loss listwise"
     assert spec.rejected, "the rejected candidate must be recorded for the log"
@@ -148,7 +149,7 @@ def test_engineer_turns_a_duplicate_into_a_seed_replicate():
     c = ctx()
     c.record(trial(1, "loss", 0.6024, "--model fm_torch --loss listwise"))
     h = Hypothesis(dimension="loss", hypothesis="within-user listwise softmax",
-                   args="--model fm_torch --loss listwise")
+                   args="--model fm_torch --loss listwise", source="playbook")
     spec = EngineerAgent().build(c, [h])
     assert spec is not None and "--seed" in spec.args
 
@@ -158,7 +159,7 @@ def test_engineer_binds_hypothesis_to_command():
     DCN-v2 while running --model mmoe."""
     c = ctx()
     h = Hypothesis(dimension="multi_task", hypothesis="MMoE with auxiliary click and like heads",
-                   args="--model mmoe --loss listwise")
+                   args="--model mmoe --loss listwise", source="playbook")
     spec = EngineerAgent().build(c, [h])
     assert spec.hypothesis == h.hypothesis
     assert "--model mmoe" in spec.command
@@ -168,7 +169,7 @@ def test_engineer_binds_hypothesis_to_command():
 def test_engineer_threads_data_dir():
     spec = EngineerAgent().build(
         ctx(), [Hypothesis(dimension="loss", hypothesis="listwise softmax test",
-                           args="--model fm_torch --loss listwise")],
+                           args="--model fm_torch --loss listwise", source="playbook")],
         data_dir="data/KuaiRand-Pure/data")
     assert "--data_dir data/KuaiRand-Pure/data" in spec.command
 
@@ -182,7 +183,7 @@ def test_qa_blocks_a_hypothesis_that_contradicts_its_command():
                      hypothesis="Deep & Cross Network v2 captures explicit feature crosses",
                      args="--model mmoe --loss listwise",
                      command="python -m pipeline.train --model mmoe --loss listwise",
-                     checkpoint="mmoe")
+                     checkpoint="mmoe", source="playbook")
     verdict = QAAgent().preflight(c, spec)
     assert not verdict.ok
     assert any("does not mention" in p for p in verdict.problems)
@@ -285,7 +286,7 @@ def test_qa_preflight_accepts_equals_form():
                      hypothesis="DeepFM adds an MLP branch over the field embeddings",
                      args="--model=deepfm --loss=listwise",
                      command="python -m pipeline.train --model=deepfm --loss=listwise",
-                     checkpoint="deepfm_listwise")
+                     checkpoint="deepfm_listwise", source="playbook")
     assert QAAgent().preflight(ctx(), spec).ok
 
 
@@ -295,7 +296,7 @@ def _spec(dimension, hypothesis, args):
     from agents.engineer import TrialSpec, checkpoint_name
     return TrialSpec(dimension=dimension, hypothesis=hypothesis, args=args,
                      command=f"python -m pipeline.train {args}",
-                     checkpoint=checkpoint_name(args))
+                     checkpoint=checkpoint_name(args), source="playbook")
 
 
 def test_qa_accepts_a_loss_hypothesis_that_does_not_name_the_model():

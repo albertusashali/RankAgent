@@ -34,6 +34,14 @@ def main():
         max_wall_clock=args.max_wall_clock,
         run_baseline=not args.skip_baseline,
     )
+
+    # Autonomy is scored on how little human input a run needed, so every option
+    # the operator actually supplied is recorded. Choosing the iteration budget
+    # by hand is a decision the agent did not make for itself — every archived
+    # run set it, and every archived run reported zero interventions.
+    agent.ledger.record_cli_overrides(
+        args, defaults={"data_dir": None, "max_iterations": None,
+                        "max_wall_clock": None, "skip_baseline": False})
     agent.start_loop()
 
 if __name__ == "__main__":

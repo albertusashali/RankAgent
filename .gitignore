@@ -49,6 +49,10 @@ models_saved/
 
 # Temporary Workspace & Active Sandbox Runs
 workspace/
+# Per-node code workspaces. One directory per tree node, each a copy of the
+# mutable pipeline source. They are run artifacts — the diffs that matter are
+# recorded in the run log, not here.
+workspaces/
 temp/
 tmp/
 *.log

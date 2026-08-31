@@ -93,6 +93,21 @@ class ProductManagerAgent(Agent):
 
     @staticmethod
     def _stalled(ctx: ResearchContext, window: int = 3) -> bool:
+        """Is the run making progress?
+
+        Two distinct ways to be stuck, and the second used to be invisible:
+
+        * experiments run but none beats the best (the original check), and
+        * experiments keep *failing*.
+
+        The old implementation filtered to ``t.succeeded`` before looking at the
+        window, so a run whose last five trials all crashed was never "stalled",
+        the PM never rotated dimension, and the Researcher kept proposing into
+        the same broken area. Failures are evidence about where not to spend the
+        budget, so they have to count.
+        """
+        if ctx.consecutive_failures() >= window:
+            return True
         recent = [t for t in ctx.trials if t.succeeded][-window:]
         if len(recent) < window or ctx.best_score is None:
             return False
@@ -113,6 +128,9 @@ Best so far: {('%.4f' % ctx.best_score) if ctx.best_score is not None else 'noth
 
 Experiments so far:
 {ctx.history_table()}
+
+Failures so far:
+{ctx.failure_report()}
 
 Measured dead ends — do not direct effort here:
 {chr(10).join('- ' + d for d in KNOWN_DEAD_ENDS)}
@@ -141,7 +159,13 @@ Set the research direction for the next few iterations.
         has been touched, exploit whichever dimension produced the best result,
         unless progress has stalled — then deliberately move elsewhere.
         """
-        unexplored = [d for d in DIMENSION_PRIORITY if d in ctx.unexplored_dimensions()]
+        # Dimensions whose last three trials all crashed are routed around, not
+        # retried: repeatedly failing is information, and spending the remaining
+        # budget re-deriving it is the stall this check exists to prevent.
+        blocked = set(ctx.failing_dimensions())
+
+        unexplored = [d for d in DIMENSION_PRIORITY
+                      if d in ctx.unexplored_dimensions() and d not in blocked]
         if unexplored:
             focus = unexplored[:2]
             return Directive(
@@ -150,6 +174,19 @@ Set the research direction for the next few iterations.
                 reasoning=(f"{', '.join(focus)} has no experiments yet; an untried axis "
                            f"is worth more than another variation of a tried one."),
                 valid_for=self.refresh_every)
+
+        if blocked:
+            alternatives = [d for d in DIMENSION_PRIORITY if d not in blocked]
+            if alternatives:
+                counts = ctx.dimension_counts()
+                alternatives.sort(key=lambda d: counts.get(d, 0))
+                return Directive(
+                    phase=f"route around {', '.join(sorted(blocked))}",
+                    focus_dimensions=alternatives[:2],
+                    avoid_dimensions=sorted(blocked),
+                    reasoning=(f"every recent experiment in {', '.join(sorted(blocked))} "
+                               f"failed to run; moving to an axis that still executes."),
+                    valid_for=self.refresh_every)
 
         best_dim = self._best_dimension(ctx)
         if self._stalled(ctx) and best_dim:

@@ -140,30 +140,34 @@ def predict_split(name: str, splits: Dict[str, List[dict]], split: str) -> np.nd
         return np.asarray(m.predict(X), dtype=np.float64)
 
     import torch
-    from pipeline.models import DEVICE, DIN, DeepFM, MMoE, TorchFM
+    from pipeline.models import DEVICE, MMoE, resolve_model
     from pipeline.train import _predict_torch
 
     dim = meta.get("embed_dim", 16)
     n_fields = len(encoder.field_names)
     hist = None
 
-    if arch == 'din':
-        seqs = extract_sequential_features(splits, encoder,
-                                           max_seq_len=meta.get("max_seq_len", 10))
-        hist = seqs[split]
-        model = DIN(encoder.embedding_rows, n_fields, pad_id=encoder.pad_id, embed_dim=dim)
-    elif arch == 'mmoe':
+    if arch == 'mmoe':
+        # MMoE has its own trainer (multiple heads, auxiliary tasks), so it is
+        # not in the single-head architecture registry.
         from pipeline.train import AUX_TASKS
         model = MMoE(encoder.total_dim, n_fields, embed_dim=dim,
                      num_experts=meta.get("num_experts", 4),
                      expert_dim=meta.get("expert_dim", 64),
                      num_tasks=1 + len(AUX_TASKS))
-    elif arch == 'deepfm':
-        model = DeepFM(encoder.total_dim, n_fields, embed_dim=dim)
-    elif arch == 'fm_torch':
-        model = TorchFM(encoder.total_dim, n_fields, embed_dim=dim)
     else:
-        raise ValueError(f"cannot rebuild unknown architecture {arch!r}")
+        # Rebuild through the SAME builder that training used. Inference used to
+        # carry its own copy of the dispatch chain, so an architecture the agent
+        # registered could train and score on validation and then fail at
+        # submission time — the one moment there is no chance to recover.
+        builder = resolve_model(arch)
+        needs_hist = getattr(builder, 'needs_history', False)
+        if needs_hist:
+            seqs = extract_sequential_features(
+                splits, encoder, max_seq_len=meta.get("max_seq_len", 10))
+            hist = seqs[split]
+        rows = encoder.embedding_rows if needs_hist else encoder.total_dim
+        model = builder(rows, n_fields, dim, encoder.pad_id)
 
     ckpt = os.path.join(CHECKPOINTS_DIR, f"{name}.pt")
     model.load_state_dict(torch.load(ckpt, map_location='cpu'))

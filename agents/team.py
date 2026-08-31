@@ -28,7 +28,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 from agents.base import LLMClient
-from agents.context import ResearchContext, TrialRecord, command_signature
+from agents.context import (ResearchContext, TrialRecord, command_signature,
+                            parse_flags)
 from agents.engineer import EngineerAgent, TrialSpec
 from agents.product_manager import Directive, ProductManagerAgent
 from agents.qa import QAAgent
@@ -62,6 +63,19 @@ class IterationPlan:
         }
 
 
+#: Models with their own trainers, which never consult ``--loss``. Testing a new
+#: objective on one of these silently trains the stock model instead.
+LOSS_IGNORING_MODELS = {"fm", "lgb"}
+
+
+def _set_flag(args: str, flag: str, value: str) -> str:
+    """Set ``--flag value`` in an argument string, in either spelling."""
+    import re
+    if re.search(rf"--{flag}[=\s]", args):
+        return re.sub(rf"--{flag}(=|\s+)\S+", f"--{flag} {value}", args, count=1)
+    return f"{args} --{flag} {value}".strip()
+
+
 class AgentTeam:
     def __init__(self, meter: TokenUsage, data_dir: Optional[str] = None,
                  pm_refresh: int = 3, proposals: int = 3, max_retries: int = 3,
@@ -88,8 +102,16 @@ class AgentTeam:
 
     # -- one iteration's planning ----------------------------------------
 
-    def plan(self, ctx: ResearchContext) -> IterationPlan:
-        """Run PM -> Researcher -> Engineer -> QA pre-flight for one iteration."""
+    def plan(self, ctx: ResearchContext, workspace=None) -> IterationPlan:
+        """Run PM -> Researcher -> Engineer -> QA pre-flight for one iteration.
+
+        When ``workspace`` is given, the Engineer may additionally *write code*
+        into it. A hypothesis that names a target file becomes a source patch;
+        one that does not stays a configuration-only trial. Both are legitimate
+        experiments, and keeping the config path alive matters: it is the
+        fallback when code generation fails, and it is what guarantees the run
+        still has a submittable result on its worst day.
+        """
         trace: List[str] = []
 
         # 1. Product Manager — direction.
@@ -111,8 +133,33 @@ class AgentTeam:
                   f"{', '.join(sorted({h.dimension for h in hypotheses}))}")
         trace.append(f"Researcher proposed {len(hypotheses)}")
 
-        # 3. Engineer — a runnable, non-duplicate, validated command.
-        spec = self.engineer.build(ctx, hypotheses, data_dir=self.data_dir)
+        # 3. Engineer — write the code first, then a runnable command.
+        #
+        # Ordering matters and was wrong at first. Argument validation used to
+        # run before code generation, so a hypothesis proposing `--loss
+        # neuralndcg` alongside a patch that registers `neuralndcg` was rejected
+        # as an unknown loss — the agent's own work was refused because it had
+        # not been done yet. Any hypothesis that asks for new code gets the code
+        # written first; its arguments are then validated against the patched
+        # source, where the new name exists.
+        spec = None
+        runnable = hypotheses
+        if workspace is not None:
+            spec, unwritable = self._implement_first(ctx, workspace, hypotheses, trace)
+            # A hypothesis whose code could not be written is not testable by
+            # running the old code under a new flag. Letting it through produced
+            # exactly the drift this project exists to prevent: a failed DCN-v2
+            # patch fell back to `--model deepfm`, and the run log recorded
+            # "Implement DCN-v2" beside a result that was plain DeepFM.
+            runnable = [h for h in hypotheses if h not in unwritable]
+
+        if spec is None:
+            if not runnable:
+                trace.append("every hypothesis required code that could not be "
+                             "written; none is testable by configuration alone")
+                self._say("    [ENGINEER]   no hypothesis is testable without "
+                          "the code that failed to generate")
+            spec = self.engineer.build(ctx, runnable, data_dir=self.data_dir)
         if spec is None:
             # Every candidate was invalid or already run. Widen the directive once
             # and ask again rather than wasting the iteration.
@@ -133,7 +180,7 @@ class AgentTeam:
         self._say(f"    [ENGINEER]   {spec.args}")
 
         # 4. QA — pre-flight before spending a training run.
-        verdict = self.qa.preflight(ctx, spec)
+        verdict = self.qa.preflight(ctx, spec, workspace=workspace)
         if not verdict.ok:
             for p in verdict.problems:
                 self._say(f"    [QA]         BLOCKED: {p}")
@@ -147,6 +194,102 @@ class AgentTeam:
         return IterationPlan(spec=spec, directive=directive, hypotheses=hypotheses,
                              trace=trace, pm_refreshed=refreshed)
 
+    def _implement_first(self, ctx: ResearchContext, workspace,
+                         hypotheses, trace: List[str]):
+        """Write code for the first hypothesis that asks for it.
+
+        Returns ``(spec, unwritable)`` — a ``TrialSpec`` carrying the patch, or
+        ``None`` to fall through to a configuration-only trial, plus the
+        hypotheses whose code could not be written and which must therefore not
+        be run as configuration-only experiments.
+
+        Falling through is not a failure mode to be avoided: the config path is
+        what keeps the run producing results on the day code generation does not
+        land. It just must not misattribute what was tested.
+        """
+        unwritable: List[Any] = []
+        from agents.codegen import registered_losses, registered_models
+        from agents.engineer import validate_args
+
+        for h in hypotheses:
+            if not (h.target_file or h.edit_sketch):
+                continue
+            if ctx.is_duplicate(h.args):
+                continue
+
+            losses_before = registered_losses(workspace.read("pipeline/models.py"))
+
+            impl, problems = self.engineer.implement(ctx, workspace, h)
+            if impl is None:
+                for p in problems[:1]:
+                    self._say(f"    [ENGINEER]   patch failed: "
+                              f"{p.splitlines()[0][:110]}")
+                trace.append(f"code generation failed for '{h.hypothesis[:50]}' "
+                             f"after {self.engineer.code_rounds} round(s)")
+                unwritable.append(h)
+                continue
+
+            known_losses = registered_losses(workspace.read("pipeline/models.py"))
+            args = h.args
+
+            # A patch that registers a new objective the command never selects
+            # is untested code. It happened on the first real code-generating
+            # run: the Engineer implemented ApproxNDCG and the trial then ran
+            # `--loss listwise`, so the log showed a diff beside a result that
+            # owed nothing to it. Point the command at the new objective, and
+            # say so — silently running the old one is the worse outcome.
+            new_losses = known_losses - losses_before
+            if new_losses:
+                picked = sorted(new_losses)[0]
+                selected = parse_flags(args).get("loss")
+                if selected not in new_losses:
+                    args = _set_flag(args, "loss", picked)
+                    self._say(f"    [ENGINEER]   the patch registered "
+                              f"'{picked}' but the command selected "
+                              f"'{selected}'; running the new objective")
+                    trace.append(f"redirected --loss to the newly implemented "
+                                 f"'{picked}' (was '{selected}')")
+
+                # `fm` (numpy) and `lgb` (LightGBM) have their own trainers and
+                # ignore --loss entirely, so pairing a new objective with either
+                # trains the stock baseline and reports it as the new method's
+                # result. A real run did exactly that: it implemented focal loss,
+                # ran `--model=fm --loss=focal`, and scored 0.6015 — the baseline
+                # to four decimals, because the loss was never called.
+                model = parse_flags(args).get("model")
+                if model in LOSS_IGNORING_MODELS:
+                    args = _set_flag(args, "model", "fm_torch")
+                    self._say(f"    [ENGINEER]   '{model}' has its own trainer "
+                              f"and ignores --loss; running '{picked}' on "
+                              f"fm_torch so the new objective is actually used")
+                    trace.append(f"redirected --model from '{model}' to fm_torch: "
+                                 f"'{model}' ignores --loss, so the new objective "
+                                 f"would not have been exercised")
+
+            # Validate against the source as it now stands, so a name this very
+            # patch registered is recognised.
+            ok, why = validate_args(
+                args,
+                known_models=registered_models(workspace.read("pipeline/train.py"),
+                                               workspace.read("pipeline/models.py")),
+                known_losses=known_losses)
+            if not ok:
+                self._say(f"    [ENGINEER]   patch applied but its arguments do "
+                          f"not run: {why}")
+                trace.append(f"patch applied but arguments invalid: {why}")
+                unwritable.append(h)
+                continue
+
+            spec = self.engineer._spec(h, args, [], self.data_dir)
+            spec.implementation = impl
+            self._say(f"    [ENGINEER]   patched {', '.join(impl.target_files)} "
+                      f"(+{impl.lines_added}/-{impl.lines_removed}, "
+                      f"{impl.rounds} round(s))")
+            trace.append(f"patched {', '.join(impl.target_files)} "
+                         f"+{impl.lines_added}/-{impl.lines_removed}")
+            return spec, unwritable
+        return None, unwritable
+
     # -- after execution --------------------------------------------------
 
     def review(self, primary: Optional[float]):
@@ -155,6 +298,39 @@ class AgentTeam:
         if verdict.note:
             self._say(f"    [QA]         {verdict.note}")
         return verdict
+
+    def repair_code(self, ctx: ResearchContext, workspace, spec: TrialSpec,
+                    traceback_text: str):
+        """Ask the Engineer to fix code it just wrote, given the traceback.
+
+        This is deliberately separate from ``recover``. The self-healing
+        debugger repairs *command lines* — halve the batch size, drop an unknown
+        flag — and those heuristics are actively wrong for a bug in generated
+        source: handed a shape mismatch inside a new loss function it would
+        "fix" it by resetting ``--embed_dim 16``, which looks like a repair,
+        changes nothing, and costs an iteration.
+        """
+        h = Hypothesis(
+            dimension=spec.dimension, hypothesis=spec.hypothesis,
+            mechanism=spec.mechanism, args=spec.args, source=spec.source,
+            target_file=(spec.implementation.target_files[0]
+                         if spec.implementation and spec.implementation.target_files
+                         else ""),
+            edit_sketch="Fix the failure in the code you just wrote. Change as "
+                        "little as possible and keep the mechanism intact.")
+        # Three rounds, not one. With a single round a malformed reply — the
+        # wrong output format, an anchor that did not match — ended the repair
+        # immediately, with no chance to act on the feedback the parser had just
+        # produced. Four of five iterations in one run died that way.
+        impl, problems = self.engineer.implement(
+            ctx, workspace, h, max_rounds=3, traceback_text=traceback_text)
+        if impl is None:
+            for p in problems[:1]:
+                self._say(f"    [ENGINEER]   repair failed: {p.splitlines()[0][:110]}")
+            return None
+        self._say(f"    [ENGINEER]   repaired {', '.join(impl.target_files)} "
+                  f"(+{impl.lines_added}/-{impl.lines_removed})")
+        return impl
 
     def recover(self, command: str, traceback_text: str, run: Callable[[str], Any]):
         return self.qa.recover(command, traceback_text, run)

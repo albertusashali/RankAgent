@@ -82,7 +82,7 @@ def guardrail_checks() -> int:
 
     ctx = ResearchContext(baseline=BASELINE, max_iterations=10, wall_clock_budget_s=600)
     h = Hypothesis(dimension="loss", hypothesis="within-user listwise softmax objective",
-                   args="--model fm_torch --loss listwise")
+                   args="--model fm_torch --loss listwise", source="playbook")
     spec = EngineerAgent().build(ctx, [h])
     check("engineer produces a runnable spec", spec is not None, True)
     team = AgentTeam(TokenUsage(), verbose=False)
@@ -98,9 +98,118 @@ def guardrail_checks() -> int:
     return 0 if not failures else 1
 
 
+def codegen_checks() -> int:
+    """The code-generation guarantees, exercised without an API key."""
+    rule("3. CODE GENERATION — patches, isolation, leak gates")
+    import shutil
+
+    from agents.codegen import registered_losses, registered_models
+    from agents.engineer import validate_args
+    from agents.patch import apply_all, parse_edit_blocks
+    from sandbox.verifier import verify_source, verify_workspace
+    from sandbox.workspace import MUTABLE, materialise, unified_diff
+
+    failures = 0
+    ws_dir = "workspaces_smoke"
+
+    def check(label, got, want=True):
+        nonlocal failures
+        ok = got == want
+        failures += 0 if ok else 1
+        print(f"  [{'ok ' if ok else 'FAIL'}] {label}")
+
+    shutil.rmtree(ws_dir, ignore_errors=True)
+    try:
+        ws = materialise(0, workspaces_dir=ws_dir)
+        print(f"  workspace: {ws.root}")
+
+        # A hand-written patch standing in for what the Engineer produces.
+        patch = """pipeline/models.py
+<<<<<<< SEARCH
+LOSSES = {
+    'pointwise': pointwise_bce,
+=======
+@ranking_loss(requires_groups=True)
+def smoke_ndcg(logits, labels, group, n_groups):
+    return -(logits * labels).sum() / (labels.sum() + 1e-9)
+
+
+LOSSES = {
+    'smoke_ndcg': smoke_ndcg,
+    'pointwise': pointwise_bce,
+>>>>>>> REPLACE"""
+
+        before = ws.snapshot()
+        edits, errors = parse_edit_blocks(patch, MUTABLE)
+        check("patch parses into edits", bool(edits) and not errors)
+        after, problems = apply_all(before, edits)
+        check("patch applies cleanly", not problems)
+        for rel, text in after.items():
+            if before.get(rel) != text:
+                ws.write(rel, text)
+
+        losses = registered_losses(ws.read("pipeline/models.py"))
+        check(f"the new loss is now registered ({sorted(losses)})",
+              "smoke_ndcg" in losses)
+        ok, why = validate_args("--model fm_torch --loss smoke_ndcg",
+                                known_losses=losses)
+        check("...and is selectable from the command line", ok)
+        ok, _ = validate_args("--model fm_torch --loss smoke_ndcg")
+        check("...but not against the unpatched repository", ok, False)
+
+        diff, (files, added, removed) = unified_diff(ws.base, ws.snapshot())
+        check(f"diff computed from disk ({files} file, +{added}/-{removed})",
+              files == 1 and added > 0 and "smoke_ndcg" in diff)
+
+        # Tampering with the scorer is reverted, not merely reported.
+        with open(ws.path("pipeline/evaluate.py"), "a", encoding="utf-8") as fh:
+            fh.write("\ndef evaluate(*a, **k):\n    return {'primary': 0.99}\n")
+        violations = ws.restore_immutable()
+        check("edit to the scorer is detected", len(violations) == 1)
+        check("...and reverted", "0.99" not in ws.read("pipeline/evaluate.py"))
+        check("...while the agent's own edit survives",
+              "smoke_ndcg" in ws.read("pipeline/models.py"))
+
+        # Leak gates.
+        leaks = {
+            "watch_ratio from play_time_ms":
+                "def f(row):\n    return row['play_time_ms'] / row['duration_ms']",
+            "play_time_ms via .get()":
+                "def f(row):\n    return row.get('play_time_ms', 0.0)",
+            "reading the test split":
+                "def f(splits):\n    return splits['test']",
+            "unsealing the labels":
+                "import os\nos.environ['RANKAGENT_UNSEAL_TEST'] = '1'",
+            "calling load_test_labels":
+                "from pipeline.data import load_test_labels\ndef f():\n    return load_test_labels()",
+        }
+        for name, src in leaks.items():
+            found = verify_source("pipeline/features.py", src)
+            check(f"blocked: {name}", any(f.fatal for f in found))
+
+        safe = verify_source("pipeline/features.py",
+                             "def f(row):\n    return [row['duration_ms'], row['tab']]")
+        check("pre-impression features still allowed", safe == [])
+        check("the shipped pipeline passes its own gate",
+              verify_workspace(ws).ok)
+
+        # Composition: a child inherits its parent's edits.
+        child = materialise(1, parent=ws, workspaces_dir=ws_dir)
+        check("a child workspace inherits the parent's code change",
+              "smoke_ndcg" in registered_losses(child.read("pipeline/models.py")))
+        sibling = materialise(2, workspaces_dir=ws_dir)
+        check("a fresh branch does NOT inherit it",
+              "smoke_ndcg" not in registered_losses(sibling.read("pipeline/models.py")))
+    finally:
+        shutil.rmtree(ws_dir, ignore_errors=True)
+
+    print(f"  --> {'PASS' if not failures else f'{failures} FAILED'}")
+    return 0 if not failures else 1
+
+
 def live_check() -> int:
     """One PM call and one Researcher call. No training is started."""
-    rule("3. LIVE — real API calls (PM + Researcher only, no training)")
+    rule("4. LIVE — real API calls (PM + Researcher only, no training)")
     load_dotenv_if_present()
     meter = TokenUsage()
     team = AgentTeam(meter, verbose=True)
@@ -146,6 +255,7 @@ def main():
 
     rc = offline_plan(a.iterations)
     rc |= guardrail_checks()
+    rc |= codegen_checks()
     if a.live:
         rc |= live_check()
     else:

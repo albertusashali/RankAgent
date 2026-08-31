@@ -24,6 +24,8 @@ import yaml
 
 from agents.context import ResearchContext
 from agents.team import AgentTeam
+from agents.qa import RANDOM_FLOOR
+from orchestrator.interventions import InterventionLedger
 from orchestrator.schemas import (ExecutionResult, HypothesisProposal,
                                   IterationLogEntry, RunSummary, TokenUsage)
 from orchestrator.tree_manager import BASELINE_VAL_PRIMARY, TreeManager
@@ -146,6 +148,22 @@ STRATEGY_BANK: List[Dict[str, str]] = [
 
 
 class RankAgentOrchestrator:
+    #: How far the reproduced baseline may sit from the published 0.6016 before
+    #: the run refuses to continue. Seed noise is 0.0008, so 0.005 is roughly
+    #: 6 sigma — comfortably wide for legitimate variation and far too narrow to
+    #: let a genuinely broken harness through.
+    BASELINE_TOLERANCE = 0.005
+
+    #: Consecutive failures after which the run halts rather than continuing.
+    #: A capable agent can legitimately fail several times in a row on a hard
+    #: problem, so this is deliberately not tight; it exists to stop a run that
+    #: is broken rather than merely struggling from burning six hours.
+    MAX_CONSECUTIVE_FAILURES = 8
+
+    #: How many times the Engineer may fix its own generated code before the
+    #: node is pruned. Each attempt costs one LLM call plus one ~6s smoke run.
+    MAX_CODE_REPAIRS = 2
+
     def __init__(self, data_dir: Optional[str] = None,
                  max_iterations: Optional[int] = None,
                  max_wall_clock: Optional[int] = None, run_id: Optional[str] = None,
@@ -195,6 +213,15 @@ class RankAgentOrchestrator:
         self.error_recoveries = 0
         self.failed_iterations = 0
         self._used_commands: set = set()
+        #: node_id -> Workspace, for every node that produced a trusted score. A
+        #: child materialises from its parent's entry here, which is the
+        #: mechanism by which successive edits compose; and the submission is
+        #: exported from the winner's, where its checkpoint actually lives.
+        self.workspaces: Dict[int, Any] = {}
+        self.ledger = InterventionLedger()
+        self.baseline_measured: Optional[float] = None
+        self.baseline_drift: Optional[float] = None
+        self.submission_decision: Dict[str, Any] = {}
         self._client = None
 
     # -- data_dir threading ------------------------------------------------
@@ -211,19 +238,38 @@ class RankAgentOrchestrator:
         print("=" * 74)
         print(">>> PHASE 0 — reproduce the official Factorization Machine baseline")
         print("=" * 74)
+        # Node 0 gets its own workspace so the baseline is reproduced through
+        # exactly the same path every later trial takes. Verifying the harness
+        # in a configuration the run never uses again would prove little.
+        ws = self._materialise(0, None)
+        self.workspaces[0] = ws
         cmd = self._with_data_dir(f"{PY} -m pipeline.train --model fm")
-        res = self.runner.run_command(cmd)
+        res = self.runner.run_command(cmd, env_vars=ws.env() if ws else None,
+                                      cwd=ws.root if ws else None)
         if res.status == "SUCCESS" and res.metrics:
             m = res.metrics
-            drift = abs(m.primary_score - BASELINE_VAL_PRIMARY)
+            drift = m.primary_score - BASELINE_VAL_PRIMARY
+            self.baseline_measured = m.primary_score
+            self.baseline_drift = drift
             print(f"[BASELINE] valid GAUC {m.gauc:.4f} | nDCG@5 {m.ndcg_5:.4f} | "
                   f"primary {m.primary_score:.4f} (published {BASELINE_VAL_PRIMARY:.4f}, "
                   f"drift {drift:+.4f})")
-            if drift > 0.005:
-                print(f"[WARN] baseline drift exceeds 0.005 — investigate before trusting deltas")
+            if abs(drift) > self.BASELINE_TOLERANCE:
+                # Previously this printed a warning and continued. Continuing
+                # means every delta the run reports is measured against a
+                # reference that does not match the published one, which makes
+                # the whole run unreportable — so it is now a halt.
+                print(f"[HALT] baseline drift {drift:+.4f} exceeds the "
+                      f"{self.BASELINE_TOLERANCE} tolerance. Every later delta "
+                      f"would be measured against an unverified reference.")
+                return False
             self.baseline_reproduced = True
             self.ctx.baseline = m.primary_score
             self.tree.record_baseline(m.primary_score, node_id=0)
+            # Keep the tree's reference in step with what was actually measured.
+            # It previously stayed at the published constant, so agent prompts
+            # and the run log reported deltas against two different numbers.
+            self.tree.baseline = m.primary_score
             self.logger.log_iteration(IterationLogEntry(
                 iteration_id=0, node_id=0, parent_node_id=None,
                 stage="Baseline Reproduction",
@@ -364,6 +410,51 @@ class RankAgentOrchestrator:
 
     # -- one iteration -----------------------------------------------------
 
+    # -- workspaces --------------------------------------------------------
+
+    def _materialise(self, iteration_id: int, parent_id: Optional[int]):
+        """This node's code state, copied from its parent's."""
+        from sandbox.workspace import materialise
+        try:
+            parent_ws = self.workspaces.get(parent_id) if parent_id is not None else None
+            return materialise(iteration_id, parent=parent_ws)
+        except Exception as exc:
+            # Losing the workspace must not lose the iteration: fall back to a
+            # configuration-only trial against the canonical repo.
+            print(f"  [WARN] could not materialise a workspace ({exc}); "
+                  f"running configuration-only against the repository")
+            return None
+
+    def _record_failure(self, iteration_id, parent_id, spec, plan, command, res,
+                        tokens_before, note: str) -> bool:
+        """Log a trial that never produced metrics, and keep the run going."""
+        self.failed_iterations += 1
+        impl = spec.implementation
+        from sandbox.debugger import classify
+        kind = classify(res.error_traceback or "")
+        self.team.record(self.ctx, iteration_id, spec, None, "FAILED", error_kind=kind)
+        trace = plan.as_log()
+        trace["failure"] = {"note": note, "status": res.status, "kind": kind}
+        self.logger.log_iteration(IterationLogEntry(
+            iteration_id=iteration_id, node_id=iteration_id, parent_node_id=parent_id,
+            stage=spec.dimension, hypothesis=spec.hypothesis,
+            rationale=spec.mechanism,
+            target_file=", ".join(impl.target_files) if impl else "(configuration only)",
+            command=command, proposal_source=spec.source,
+            code_diff=impl.diff if impl else "",
+            status="FAILED", metrics=None, agent_trace=trace,
+            error_recovery={"recovered": False, "failure_kind": kind,
+                            "attempts": [{"strategy": note,
+                                          "detail": (res.error_traceback or "")[-600:]}]},
+            prompt_tokens=self.tokens.prompt_tokens - tokens_before[0],
+            completion_tokens=self.tokens.completion_tokens - tokens_before[1],
+            llm_calls=self.tokens.calls - tokens_before[2],
+            cumulative_prompt_tokens=self.tokens.prompt_tokens,
+            cumulative_completion_tokens=self.tokens.completion_tokens,
+            wall_clock_seconds=res.wall_clock_seconds))
+        return self.tree.add_node(iteration_id, parent_id, spec.hypothesis,
+                                  "-", None)
+
     def run_iteration(self, iteration_id: int) -> bool:
         """Execute one hypothesis. Returns whether the run should halt."""
         print(f"\n{'=' * 74}\n>>> ITERATION {iteration_id}/{self.max_iterations}\n{'=' * 74}")
@@ -377,7 +468,14 @@ class RankAgentOrchestrator:
                          self.tokens.calls)
 
         self.ctx.iteration = iteration_id
-        plan = self.team.plan(self.ctx)
+
+        # Materialise this node's code from its PARENT, so an edit here sits on
+        # top of every edit already accepted on that branch. This is what makes
+        # improvements compose instead of each trial restarting from baseline.
+        parent_id = self.tree.select_parent()
+        workspace = self._materialise(iteration_id, parent_id)
+
+        plan = self.team.plan(self.ctx, workspace=workspace)
 
         if not plan.ok:
             # The team could not produce a runnable, non-duplicate experiment.
@@ -406,9 +504,77 @@ class RankAgentOrchestrator:
 
         print(f"  Dimension  : {spec.dimension}")
         print(f"  Hypothesis : {spec.hypothesis}")
+        if spec.implementation is not None:
+            impl = spec.implementation
+            print(f"  Code change: {', '.join(impl.target_files)} "
+                  f"(+{impl.lines_added}/-{impl.lines_removed})")
         print(f"  Command    : {command}")
 
-        res = self.runner.run_command(command)
+        env = workspace.env() if workspace else None
+        cwd = workspace.root if workspace else None
+
+        # Smoke gate: one epoch on a small user subsample, ~5s. Generated code
+        # fails often, and without this every syntax slip or shape bug costs a
+        # full training run. Only worth it when code was actually written —
+        # a config-only trial is running code that already passed this once.
+        if workspace is not None and spec.implementation is not None:
+            smoke = self.runner.run_command(f"{command} --smoke", env_vars=env,
+                                            cwd=cwd, timeout_seconds=300)
+
+            # A generated patch that crashes is a bug report, not a dead end.
+            # Hand the traceback back to the Engineer and let it fix its own
+            # code — the whole exchange costs seconds because the smoke run is
+            # subsampled, where discovering the same bug in a full run would
+            # cost minutes.
+            def smoke_verdict(r):
+                """Did the smoke run produce something worth a full run?
+
+                Exit code alone is not enough. A loss with the sign flipped, or
+                one that normalises over the wrong axis, trains happily to
+                nonsense — and a run that scores below the random floor is a
+                broken implementation, not a weak idea. That is checkable on the
+                subsample: the random-scoring floor does not depend on how long
+                you trained. One run reached the full trainer with a ListMLE
+                that scored 0.3774, well under the 0.4834 floor, because smoke
+                only asked whether the process exited zero.
+                """
+                if r.failed:
+                    return r.status, r.error_traceback or ""
+                if r.metrics and r.metrics.primary_score < RANDOM_FLOOR:
+                    return "BELOW_RANDOM", (
+                        f"The smoke run completed but scored "
+                        f"{r.metrics.primary_score:.4f}, below the "
+                        f"{RANDOM_FLOOR} floor a random scorer achieves. The "
+                        f"implementation is wrong, not merely weak — check the "
+                        f"sign of the loss, the axis it reduces over, and that "
+                        f"it returns a scalar to be MINIMISED.")
+                return None, ""
+
+            repairs = 0
+            bad, why = smoke_verdict(smoke)
+            while bad and repairs < self.MAX_CODE_REPAIRS:
+                repairs += 1
+                print(f"  [SMOKE FAILED:{bad}] repair attempt "
+                      f"{repairs}/{self.MAX_CODE_REPAIRS}")
+                fixed = self.team.repair_code(self.ctx, workspace, spec, why)
+                if fixed is None:
+                    break
+                spec.implementation = fixed
+                self.error_recoveries += 1
+                smoke = self.runner.run_command(f"{command} --smoke", env_vars=env,
+                                                cwd=cwd, timeout_seconds=300)
+                bad, why = smoke_verdict(smoke)
+
+            if bad:
+                print(f"  [PRUNED] {bad} after {repairs} repair attempt(s); "
+                      f"not spending a full run on it")
+                return self._record_failure(
+                    iteration_id, parent_id, spec, plan, command, smoke,
+                    tokens_before, note=f"{bad} after {repairs} repair attempts")
+            print(f"  [SMOKE] passed in {smoke.wall_clock_seconds:.0f}s"
+                  + (f" after {repairs} repair(s)" if repairs else ""))
+
+        res = self.runner.run_command(command, env_vars=env, cwd=cwd)
         recovery: Optional[dict] = None
         status = "REJECTED"
 
@@ -440,13 +606,30 @@ class RankAgentOrchestrator:
         if metrics and not verdict.trustworthy:
             status = "REJECTED"
 
-        parent = self.tree.select_parent()
+        impl = spec.implementation
+        target_file = ", ".join(impl.target_files) if impl else "(configuration only)"
+
+        parent = parent_id
         converged = self.tree.add_node(iteration_id, parent, spec.hypothesis,
-                                       "pipeline/train.py", trusted)
+                                       target_file, trusted)
         if trusted is not None and status != "ERROR_RECOVERED":
             status = self.tree.nodes[iteration_id]["status"]
         elif metrics is None:
             status = "FAILED"
+
+        # Remember every node's workspace, not just the ones that improved. The
+        # submission is exported from the WINNING node's workspace, and its
+        # checkpoints live only there; resolving the winner by name against the
+        # repository's shared checkpoints/ directory is what previously let a
+        # stale model from an earlier run be exported under this run's score.
+        if workspace is not None and trusted is not None:
+            self.workspaces[iteration_id] = workspace
+
+        # A code change that improved on its parent becomes part of the lineage
+        # every later node builds on and every later prompt is told about.
+        if impl is not None and status == "ACCEPTED":
+            self.ctx.edits_applied.append(impl.summary or spec.hypothesis[:60])
+            self.ctx.lineage = "baseline + " + " + ".join(self.ctx.edits_applied)
 
         self.team.record(self.ctx, iteration_id, spec,
                          trusted.primary_score if trusted else None, status,
@@ -457,9 +640,13 @@ class RankAgentOrchestrator:
         self.logger.log_iteration(IterationLogEntry(
             iteration_id=iteration_id, node_id=iteration_id, parent_node_id=parent,
             stage=spec.dimension, hypothesis=spec.hypothesis,
-            rationale=spec.mechanism, target_file="pipeline/train.py",
+            rationale=spec.mechanism, target_file=target_file,
             command=command, proposal_source=spec.source,
-            code_diff=self.logger.capture_diff(),
+            # The diff is computed from the bytes on disk before and after the
+            # patch, against this node's PARENT — not from what the model said
+            # it did, and not from `git diff` over the repo working tree, which
+            # is why every archived run logged unrelated README churn.
+            code_diff=impl.diff if impl else "",
             status=status, metrics=metrics.model_dump() if metrics else None,
             delta_over_baseline=metrics.delta_from_baseline if metrics else None,
             error_recovery=recovery, agent_trace=trace,
@@ -475,9 +662,67 @@ class RankAgentOrchestrator:
 
     # -- terminal state ----------------------------------------------------
 
+    def designate_submission(self) -> Dict[str, Any]:
+        """Choose the final submission, and record *why*.
+
+        This used to be a bare argmax with nothing logged. Two things were wrong
+        with that. First, the margin was never weighed against seed noise, so a
+        +0.0001 winner was designated as confidently as a +0.01 one even though
+        sigma is 0.0008. Second, when nothing beat the baseline the run silently
+        exported the organizers' own FM as "the agent's final submission" — a
+        result the log should state outright rather than obscure.
+        """
+        scored = [(nid, n) for nid, n in self.tree.nodes.items()
+                  if n.get("primary") is not None]
+        scored.sort(key=lambda t: -t[1]["primary"])
+        sigma = self.ctx.seed_noise
+
+        decision: Dict[str, Any] = {"sigma": sigma}
+        if not scored:
+            decision.update(chosen_iteration=None, rationale=(
+                "No experiment produced a trustworthy validation score, so there "
+                "is nothing to submit."))
+            return decision
+
+        best_id, best = scored[0]
+        decision["chosen_iteration"] = best_id
+        decision["valid_primary"] = best["primary"]
+        decision["delta_vs_baseline"] = best["primary"] - self.tree.baseline
+        decision["beat_baseline"] = best_id != 0
+
+        if len(scored) > 1:
+            runner_id, runner = scored[1]
+            margin = best["primary"] - runner["primary"]
+            decision.update(runner_up_iteration=runner_id,
+                            runner_up_primary=runner["primary"],
+                            margin=margin, margin_in_sigma=margin / sigma)
+            significant = margin > 3 * sigma
+            decision["margin_is_significant"] = significant
+            decision["rationale"] = (
+                f"Iteration {best_id} scored {best['primary']:.4f} on validation, "
+                f"{margin:+.4f} ({margin / sigma:.1f} sigma) ahead of iteration "
+                f"{runner_id} at {runner['primary']:.4f}. "
+                + ("That margin exceeds 3 sigma, so the ordering is trustworthy."
+                   if significant else
+                   f"That margin is within {3 * sigma:.4f} (3 sigma of seed noise), "
+                   f"so the two are not separated by this evidence; the higher "
+                   f"validation score is used as the tie-break."))
+        else:
+            decision["rationale"] = (
+                f"Iteration {best_id} is the only trustworthy result, at "
+                f"{best['primary']:.4f}.")
+
+        if best_id == 0:
+            decision["rationale"] += (
+                " NOTE: this is the reproduced official baseline. No experiment "
+                "in this run improved on it, and the submission is therefore the "
+                "baseline model rather than an agent-discovered one.")
+        return decision
+
     def build_submission(self) -> Optional[str]:
         """Export the validation-best checkpoint. The only step that reads test rows."""
-        best_id = self.tree.best_node_id
+        decision = self.submission_decision = self.designate_submission()
+        best_id = decision.get("chosen_iteration")
         if best_id is None:
             print("[SUBMIT] no successful iteration; nothing to submit")
             return None
@@ -485,11 +730,30 @@ class RankAgentOrchestrator:
         if not name:
             print("[SUBMIT] could not identify the winning checkpoint; skipping export")
             return None
+
         out = os.path.join("submissions", "kuairand_pure_final.csv")
-        print(f"\n[SUBMIT] exporting validation-best checkpoint {name!r} "
-              f"(iteration {best_id}, valid primary {self.tree.best_primary_score:.4f})")
-        cmd = (f"{PY} -m pipeline.submit --generate --checkpoint {name} --file {out}")
-        res = self.runner.run_command(self._with_data_dir(cmd))
+        print(f"\n[SUBMIT] designated iteration {best_id}, checkpoint {name!r} "
+              f"(valid primary {decision['valid_primary']:.4f})")
+        print(f"         {decision['rationale']}")
+
+        # Export from the WINNING NODE'S workspace. Its weights live in that
+        # node's own checkpoints/ directory, and checkpoint names encode only
+        # model and loss — so resolving the name against the shared repository
+        # directory can pick up a same-named model from a different run, or from
+        # a later losing trial, and ship it under this score.
+        ws = self.workspaces.get(best_id)
+        env = ws.env() if ws else None
+        cwd = ws.root if ws else None
+        if ws is None:
+            print("         [WARN] the winning node's workspace is unavailable; "
+                  "falling back to the repository checkpoint directory")
+
+        cmd = f"{PY} -m pipeline.submit --generate --checkpoint {name} --file {out}"
+        if cwd:
+            # submit.py writes relative to cwd, so keep the artefact in the repo.
+            cmd = (f"{PY} -m pipeline.submit --generate --checkpoint {name} "
+                   f"--file {os.path.abspath(out)}")
+        res = self.runner.run_command(self._with_data_dir(cmd), env_vars=env, cwd=cwd)
         if res.status == "SUCCESS" or "VALIDATION PASS" in (res.stdout_summary or ""):
             return out
         print(f"[SUBMIT FAILED] {(res.error_traceback or '')[-600:]}")
@@ -545,7 +809,7 @@ class RankAgentOrchestrator:
                     break
             except KeyboardInterrupt:
                 halt_reason = "interrupted by operator"
-                self.manual_interventions += 1
+                self.ledger.record_interrupt(f"iteration {it}", iteration=it)
                 print("\n[HALT] interrupted")
                 break
             except Exception as exc:
@@ -553,8 +817,82 @@ class RankAgentOrchestrator:
                 self.failed_iterations += 1
                 print(f"  [ORCHESTRATOR ERROR] {type(exc).__name__}: {exc} — continuing")
 
-        submission = self.build_submission()
-        self._write_summary(t0, halt_reason, submission)
+            # Stall and divergence guards. Convergence only looks at the
+            # best-so-far curve, which is monotone and appended to only on
+            # success — so a run where everything crashes can never converge,
+            # and a run whose scores steadily degrade reads as converged. Both
+            # would otherwise burn the full budget or halt for the wrong reason.
+            stall = self._stall_reason()
+            if stall:
+                halt_reason = stall
+                print(f"\n[HALT] {stall}")
+                break
+
+        # The submission and the summary are the deliverables. They previously
+        # sat outside every guard, so an exception in either — or a second
+        # Ctrl-C during the export, which spawns its own subprocess — meant the
+        # run produced no RunSummary at all.
+        submission = None
+        try:
+            submission = self.build_submission()
+        except KeyboardInterrupt:
+            halt_reason = "interrupted by operator during submission export"
+            self.ledger.record_interrupt("submission export")
+        except Exception as exc:
+            print(f"[SUBMIT FAILED] {type(exc).__name__}: {exc}")
+        finally:
+            self._write_summary(t0, halt_reason, submission)
+
+    def _stall_reason(self) -> Optional[str]:
+        """Halt conditions the convergence rule structurally cannot detect."""
+        consecutive = self.ctx.consecutive_failures()
+        if consecutive >= self.MAX_CONSECUTIVE_FAILURES:
+            return (f"stalled: {consecutive} consecutive experiments failed to "
+                    f"produce a result. Continuing would spend the remaining "
+                    f"budget re-deriving the same failure.")
+        used = len([n for n in self.tree.nodes if n != 0])
+        if used >= self.max_iterations // 2 and not self.tree.has_result():
+            return (f"stalled: {used} iterations used and no experiment has yet "
+                    f"produced a trustworthy score.")
+        return None
+
+    def _autonomy_report(self) -> Dict[str, Any]:
+        """How much of this run the model actually authored.
+
+        A run with no API key and a run driven entirely by the model used to
+        produce structurally identical logs — same fields, same
+        ``proposal_source: "llm"`` on every iteration — differing only in a token
+        total a reader would have to notice was zero. Anyone reading the log to
+        judge autonomy deserves to be told directly.
+        """
+        entries = self.logger.entries
+        trials = [e for e in entries if e.get("iteration_id", 0) > 0]
+        llm_authored = [e for e in trials if e.get("proposal_source") == "llm"]
+        with_code = [e for e in trials if (e.get("code_diff") or "").strip()]
+        # Search all entries, not just trials: when nothing beats the baseline
+        # the winner IS iteration 0, and reporting its provenance as null hides
+        # the most important fact about the run.
+        best = next((e for e in entries
+                     if e.get("iteration_id") == self.tree.best_node_id), None)
+        return {
+            "llm_available": self.team.llm_available,
+            "iterations_total": len(trials),
+            "iterations_llm_authored": len(llm_authored),
+            "iterations_from_playbook": len(trials) - len(llm_authored),
+            "nodes_with_generated_code": len(with_code),
+            "generated_lines_added": sum(
+                sum(1 for l in (e.get("code_diff") or "").splitlines()
+                    if l.startswith("+") and not l.startswith("+++"))
+                for e in with_code),
+            "best_node_source": (best or {}).get("proposal_source"),
+            "best_node_had_code_change": bool((best or {}).get("code_diff", "").strip()),
+            "note": ("This run had no usable API key: every hypothesis came from "
+                     "the hard-coded playbook and no code was generated. It "
+                     "demonstrates the harness, not autonomy."
+                     if not self.team.llm_available else
+                     f"{len(llm_authored)}/{len(trials)} iterations were authored "
+                     f"by the model; {len(with_code)} applied a code patch."),
+        }
 
     def _write_summary(self, t0: float, halt_reason: str, submission: Optional[str]):
         elapsed = time.time() - t0
@@ -567,10 +905,15 @@ class RankAgentOrchestrator:
             iteration_cap=self.max_iterations,
             halt_reason=halt_reason,
             wall_clock_seconds=elapsed,
+            baseline_measured=self.baseline_measured,
+            baseline_drift=self.baseline_drift,
+            submission_decision=self.submission_decision,
+            interventions=self.ledger.as_list(),
+            autonomy=self._autonomy_report(),
             total_prompt_tokens=self.tokens.prompt_tokens,
             total_completion_tokens=self.tokens.completion_tokens,
             llm_calls=self.tokens.calls,
-            manual_interventions=self.manual_interventions,
+            manual_interventions=len(self.ledger),
             error_recoveries=self.error_recoveries,
             failed_iterations=self.failed_iterations,
             submission_path=submission,
@@ -591,7 +934,15 @@ class RankAgentOrchestrator:
             print(f"    {role:<16s}: {c['prompt'] + c['completion']:>7,d} tokens "
                   f"in {c['calls']} call{'s' if c['calls'] != 1 else ''}")
         print(f"  recoveries/failures: {self.error_recoveries}/{self.failed_iterations}")
-        print(f"  manual intervention: {self.manual_interventions}")
+        print(f"  code patches       : {summary.autonomy.get('nodes_with_generated_code', 0)}"
+              f" of {summary.autonomy.get('iterations_total', 0)} iterations "
+              f"(+{summary.autonomy.get('generated_lines_added', 0)} lines)")
+        print(f"  llm-authored       : "
+              f"{summary.autonomy.get('iterations_llm_authored', 0)}"
+              f"/{summary.autonomy.get('iterations_total', 0)} iterations")
+        print(f"  manual intervention: {self.ledger.summary_line()}")
+        if summary.submission_decision.get("rationale"):
+            print(f"  designated         : {summary.submission_decision['rationale']}")
         print(f"  submission         : {submission or 'not produced'}")
         print("=" * 74)
 

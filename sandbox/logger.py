@@ -12,12 +12,16 @@ any error/recovery event. Two things are deliberate:
   * The markdown log is **truncated at the start of a run**, not appended to
     forever. The previous version appended, so repeated runs interleaved and the
     file showed "Iteration 0" four times with different numbers.
-  * ``capture_diff`` shells out to ``git diff`` so the recorded diff is what
-    actually changed on disk, rather than a restatement of the command.
+  * The ``code_diff`` recorded per iteration is computed by
+    ``sandbox.workspace.unified_diff`` from the mutable source files before and
+    after the Engineer's patch, against the node's parent. It used to be
+    captured by shelling out to ``git diff`` over the repository working tree,
+    which recorded whatever happened to be uncommitted — in every archived run
+    that meant an unrelated README change, in an entry claiming to show the
+    change the agent applied.
 """
 import json
 import os
-import subprocess
 import time
 from typing import Dict, List, Optional
 
@@ -54,32 +58,6 @@ class RunLogger:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(header)
 
-    # -- diffs -------------------------------------------------------------
-
-    #: Paths the agent's own bookkeeping writes to. Excluded from the captured
-    #: diff because including them makes the field self-referential: the log
-    #: records a diff of the log, which contains the previous diff of the log.
-    #: In practice that consumed the entire size budget with churn and left every
-    #: iteration's `code_diff` byte-identical and uninformative.
-    DIFF_EXCLUDES = ("logs", "submissions", "checkpoints", "data")
-
-    def capture_diff(self, max_chars: int = 8000) -> str:
-        """The working-tree diff at this moment, as the agent left it.
-
-        Only source changes — the agent's own artefacts are excluded, so this
-        field answers "what code did this iteration change?" and nothing else.
-        """
-        cmd = ["git", "diff", "--unified=3", "--"]
-        cmd += [f":(exclude){p}" for p in self.DIFF_EXCLUDES]
-        try:
-            out = subprocess.run(cmd, capture_output=True, text=True,
-                                 encoding="utf-8", errors="replace", timeout=20)
-            diff = out.stdout or ""
-        except Exception as exc:
-            return f"(diff unavailable: {exc})"
-        if not diff.strip():
-            return "(no working-tree changes; trial varied configuration only)"
-        return diff[:max_chars] + ("\n… truncated …" if len(diff) > max_chars else "")
 
     # -- checkpoints -------------------------------------------------------
 

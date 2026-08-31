@@ -29,11 +29,17 @@ BASELINE_VAL_PRIMARY = 0.6016
 class TreeManager:
     def __init__(self, epsilon: float = 0.002, n_convergence: int = 3,
                  max_iterations: int = 50,
-                 baseline: float = BASELINE_VAL_PRIMARY):
+                 baseline: float = BASELINE_VAL_PRIMARY,
+                 min_iterations: Optional[int] = None):
         self.epsilon = epsilon
         self.n_convergence = n_convergence
         self.max_iterations = max_iterations
         self.baseline = baseline
+        #: Successful trials that must happen before convergence may fire at
+        #: all. Never more than half the budget, so a short run still ends.
+        self.min_iterations = (min_iterations if min_iterations is not None
+                               else min(max(8, 3 * n_convergence),
+                                        max(1, max_iterations // 2)))
 
         self.nodes: Dict[int, Dict[str, Any]] = {}
         self.best_primary_score: float = float('-inf')
@@ -104,6 +110,23 @@ class TreeManager:
         return self._check_iteration_cap(node_id)
 
     def _converged(self) -> bool:
+        """The organizers' rule, with a floor on how early it may fire.
+
+        As written, ``eps=0.002`` over ``N=3`` can trigger on the FOURTH
+        successful trial — and it did: an archived run halted at iteration 4 of a
+        10-iteration budget. On a benchmark whose realistic total headroom is
+        around 0.003, "no 0.002 jump in three tries" is the normal case, not
+        evidence of exhaustion, so the rule alone ends most runs before they have
+        explored anything.
+
+        ``min_iterations`` does not change the convergence criterion — it only
+        refuses to *apply* it until the run has had a fair chance. That is the
+        safe direction to err in: halting late costs some budget, halting early
+        costs the result. What the run is judged on is a sustained ability to
+        keep improving, which cannot be shown in three trials.
+        """
+        if len(self.best_history) < self.min_iterations:
+            return False
         if len(self.best_history) <= self.n_convergence:
             return False
         gain = self.best_history[-1] - self.best_history[-1 - self.n_convergence]

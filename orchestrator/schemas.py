@@ -116,6 +116,21 @@ class RunSummary(BaseModel):
     error_recoveries: int = 0
     failed_iterations: int = 0
     submission_path: Optional[str] = None
+    #: What the baseline reproduction actually measured, and how far it drifted
+    #: from the published reference. Previously only a bool was recorded, so a
+    #: run whose baseline came out at 0.55 looked identical to one that hit
+    #: 0.6015 exactly.
+    baseline_measured: Optional[float] = None
+    baseline_drift: Optional[float] = None
+    #: Which result was designated final and why — margin over the runner-up in
+    #: units of seed noise, and an explicit statement when nothing beat the
+    #: baseline. The choice used to be an unrecorded argmax.
+    submission_decision: Dict[str, Any] = Field(default_factory=dict)
+    #: Every human touchpoint in the run. Autonomy is scored on this, so it
+    #: records what was actually supplied rather than what flatters the run.
+    interventions: List[Dict[str, Any]] = Field(default_factory=list)
+    #: How much of the run the model actually authored, per stage.
+    autonomy: Dict[str, Any] = Field(default_factory=dict)
     #: Token spend attributed per agent role, so the cost of the multi-agent
     #: design is visible rather than buried in a single total.
     cost_by_agent: Dict[str, Dict[str, int]] = Field(default_factory=dict)

@@ -55,11 +55,44 @@ class QAAgent(Agent):
 
     # -- before the trial -------------------------------------------------
 
-    def preflight(self, ctx: ResearchContext, spec: TrialSpec) -> PreflightVerdict:
-        """Cheap checks that cost nothing next to a training run."""
-        problems: List[str] = []
+    def preflight(self, ctx: ResearchContext, spec: TrialSpec,
+                  workspace=None) -> PreflightVerdict:
+        """Cheap checks that cost nothing next to a training run.
 
-        ok, why = validate_args(spec.args)
+        With a workspace, this also gates the *code* the Engineer just wrote:
+        immutable files are restored, and every mutable file is scanned for
+        label leakage, forbidden imports and unsafe calls. All of it is pure AST
+        work costing milliseconds, which is the point — a leak found here costs
+        nothing, and the same leak found after a training run has already
+        polluted the best-so-far score.
+        """
+        problems: List[str] = []
+        known_models = known_losses = None
+
+        if workspace is not None:
+            from sandbox.verifier import verify_workspace
+            from agents.codegen import registered_losses, registered_models
+
+            report = verify_workspace(workspace)
+            problems.extend(report.messages())
+
+            # Validate --model/--loss against what THIS node's source actually
+            # registers, not against the canonical repo. A loss the Engineer
+            # just wrote exists only in the workspace, so checking the repo
+            # would reject the agent's own work; checking a hardcoded list would
+            # make the work unreachable. Both names are read statically, because
+            # importing the workspace's models.py would pull torch into the
+            # orchestrator and it cannot coexist with LightGBM in one process.
+            try:
+                models_src = workspace.read("pipeline/models.py")
+                known_losses = registered_losses(models_src)
+                known_models = registered_models(
+                    workspace.read("pipeline/train.py"), models_src)
+            except OSError:
+                pass
+
+        ok, why = validate_args(spec.args, known_models=known_models,
+                                known_losses=known_losses)
         if not ok:
             problems.append(f"arguments do not parse: {why}")
 
@@ -109,7 +142,19 @@ class QAAgent(Agent):
 
         So: for loss-dimension trials the objective must be named; otherwise the
         model must be. Either satisfies the check when the dimension is unclear.
+
+        It is skipped entirely once the trial carries a code patch. The check
+        exists to catch prose and command drifting apart when the command is the
+        *whole* experiment. When the experiment is a diff, the hypothesis
+        describes the code — "implement ApproxNDCG as a smooth surrogate of
+        nDCG@5" — while the command may legitimately name whatever architecture
+        the new objective is being tried on. Demanding the prose name the model
+        blocked every iteration of a real run for exactly this reason; the diff
+        itself is the far stronger evidence of what was actually tested.
         """
+        if spec.implementation is not None and not spec.implementation.is_empty:
+            return True
+
         text = f"{spec.hypothesis} {spec.mechanism}".lower()
         flags = parse_flags(spec.args)
         model, loss = flags.get("model"), flags.get("loss")

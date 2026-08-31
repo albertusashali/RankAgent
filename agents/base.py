@@ -81,7 +81,15 @@ class LLMClient:
         slot["completion"] += int(completion_tokens or 0)
         slot["calls"] += 1
 
-    def complete(self, agent: str, system: str, user: str, max_tokens: int = 1500) -> str:
+    def complete(self, agent: str, system: str, user: str, max_tokens: int = 1500,
+                 json_mode: bool = True) -> str:
+        """One completion. Set ``json_mode=False`` for free-form output.
+
+        Most agents return a JSON object, so JSON mode is the default. The
+        Engineer's code path must not use it: it returns SEARCH/REPLACE blocks,
+        and OpenAI rejects the request outright when JSON mode is on and the
+        prompt does not ask for JSON.
+        """
         if not self.available:
             raise LLMUnavailable("no API key configured")
         if self._kind == "anthropic":
@@ -91,11 +99,17 @@ class LLMClient:
             text = "".join(b.text for b in resp.content if b.type == "text")
             self._record(agent, resp.usage.input_tokens, resp.usage.output_tokens)
             return text
+        kwargs: Dict[str, Any] = {}
+        if json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
         resp = self._client.chat.completions.create(
             model=self.model, temperature=0.3,
-            response_format={"type": "json_object"},
+            # max_tokens was previously not forwarded at all, so a patch large
+            # enough to matter was truncated by the provider default.
+            max_tokens=max_tokens,
             messages=[{"role": "system", "content": system},
-                      {"role": "user", "content": user}])
+                      {"role": "user", "content": user}],
+            **kwargs)
         text = resp.choices[0].message.content or ""
         self._record(agent, resp.usage.prompt_tokens, resp.usage.completion_tokens)
         return text

@@ -35,7 +35,11 @@ from pipeline.models_np import NumpyFM
 # time. A process that trains the numpy baseline loads neither. Keep it that way:
 # a module-level `import torch` here would break `--model lgb` again.
 
-CHECKPOINTS_DIR = "checkpoints"
+# Where weights and .meta.json land. Overridable per node so that two workspaces
+# training the same architecture cannot clobber each other's checkpoints — the
+# names encode only model and loss, so without this a later losing run silently
+# replaces an earlier winning one and the submission exports the wrong weights.
+CHECKPOINTS_DIR = os.environ.get("RANKAGENT_CHECKPOINTS", "checkpoints")
 os.makedirs(CHECKPOINTS_DIR, exist_ok=True)
 
 #: Auxiliary MMoE tasks, in tower order after task 0 (long_view).
@@ -176,7 +180,7 @@ def train_torch(splits: Dict, arch: str = 'fm_torch', loss: str = 'listwise',
     """Train an embedding model under a pointwise, pairwise or listwise objective."""
     import torch
     import torch.nn as nn
-    from pipeline.models import DEVICE, LOSSES, DIN, DeepFM, TorchFM
+    from pipeline.models import DEVICE, resolve_loss, resolve_model
 
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -186,27 +190,27 @@ def train_torch(splits: Dict, arch: str = 'fm_torch', loss: str = 'listwise',
     Xva, yva, uva = enc['valid']
     n_fields = len(encoder.field_names)
 
-    needs_hist = (arch == 'din')
+    builder = resolve_model(arch)
+    # Whether a model consumes the user's impression sequence is declared on the
+    # builder, so registering an architecture is a single-site edit.
+    needs_hist = getattr(builder, 'needs_history', False)
     if needs_hist:
         seqs = extract_sequential_features(splits, encoder, max_seq_len=max_seq_len)
         Htr, Hva = seqs['train'], seqs['valid']
     else:
         Htr = Hva = None
 
-    # DIN indexes the reserved padding row, so its table is one row longer.
+    # A history-consuming model indexes the reserved padding row, so its table is
+    # one row longer.
     rows = encoder.embedding_rows if needs_hist else encoder.total_dim
-    if arch == 'fm_torch':
-        model = TorchFM(rows, n_fields, embed_dim)
-    elif arch == 'deepfm':
-        model = DeepFM(rows, n_fields, embed_dim)
-    elif arch == 'din':
-        model = DIN(rows, n_fields, pad_id=encoder.pad_id, embed_dim=embed_dim)
-    else:
-        raise ValueError(f"unknown arch {arch!r}")
-    model = model.to(DEVICE)
+    model = builder(rows, n_fields, embed_dim, encoder.pad_id).to(DEVICE)
 
-    loss_fn = LOSSES[loss]
-    grouped = loss in ('listwise', 'bpr')
+    loss_fn = resolve_loss(loss)
+    # Whether the objective is computed within a user's impression list is a
+    # property of the loss, declared by @ranking_loss. Reading it here rather
+    # than testing `loss in ('listwise','bpr')` means a newly registered
+    # listwise-family loss gets grouped batches instead of shuffled ones.
+    grouped = getattr(loss_fn, 'requires_groups', loss in ('listwise', 'bpr'))
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     rng = np.random.default_rng(seed)
     groups = _user_groups(utr) if grouped else None
@@ -280,7 +284,7 @@ def train_mmoe(splits: Dict, embed_dim: int = 16, num_experts: int = 4,
     """
     import torch
     import torch.nn as nn
-    from pipeline.models import DEVICE, LOSSES, MMoE
+    from pipeline.models import DEVICE, MMoE, resolve_loss
 
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -295,8 +299,8 @@ def train_mmoe(splits: Dict, embed_dim: int = 16, num_experts: int = 4,
                  num_experts=num_experts, expert_dim=expert_dim,
                  num_tasks=1 + len(AUX_TASKS)).to(DEVICE)
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-6)
-    main_loss = LOSSES[loss]
-    grouped = loss in ('listwise', 'bpr')
+    main_loss = resolve_loss(loss)
+    grouped = getattr(main_loss, 'requires_groups', loss in ('listwise', 'bpr'))
     bce = nn.BCEWithLogitsLoss()
     rng = np.random.default_rng(seed)
     groups = _user_groups(utr) if grouped else None
@@ -426,14 +430,28 @@ def train_lightgbm(splits: Dict, num_trees: int = 400, lr: float = 0.05,
 # CLI
 # ---------------------------------------------------------------------------
 
+#: Architectures shipped with the harness. This is documentation, NOT a
+#: whitelist: ``--model`` deliberately has no ``choices=``, so a model the agent
+#: registers in a generated patch is selectable without also editing the parser.
 ARCHS = ['fm', 'fm_torch', 'deepfm', 'din', 'mmoe', 'lgb']
+
+#: Objectives shipped with the harness. Same rule — the authoritative list is
+#: ``pipeline.models.LOSSES``, which cannot be imported here because it pulls
+#: torch to module scope and re-breaks ``--model lgb`` (see the import note at
+#: the top of this file). Names are therefore validated inside the trainer,
+#: where torch is already loaded, via ``models.resolve_loss``.
+LOSSES_DOC = ['pointwise', 'listwise', 'bpr']
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Train a KuaiRand-Pure ranker (valid-only selection)")
     p.add_argument('--data_dir', default=None)
-    p.add_argument('--model', default='fm', choices=ARCHS)
-    p.add_argument('--loss', default='listwise', choices=['pointwise', 'listwise', 'bpr'])
+    p.add_argument('--model', default='fm',
+                   help=f"architecture; shipped: {', '.join(ARCHS)} "
+                        f"(agent-registered models are also accepted)")
+    p.add_argument('--loss', default='listwise',
+                   help=f"ranking objective; shipped: {', '.join(LOSSES_DOC)} "
+                        f"(any key in pipeline.models.LOSSES is accepted)")
     p.add_argument('--embed_dim', type=int, default=16)
     p.add_argument('--experts', type=int, default=4)
     p.add_argument('--expert_dim', type=int, default=64)
@@ -448,7 +466,35 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--max_seq_len', type=int, default=10)
     p.add_argument('--cwm', action='store_true', help='add music_id/video_type/upload_type fields')
     p.add_argument('--seed', type=int, default=0)
+    p.add_argument('--smoke', action='store_true',
+                   help='correctness check: one epoch on a small user subsample. '
+                        'The reported score is NOT comparable to a full run.')
+    p.add_argument('--smoke_users', type=int, default=3000,
+                   help='users retained in --smoke mode (default 3000)')
     return p
+
+
+def subsample_for_smoke(splits: Dict[str, List[dict]], max_users: int = 3000,
+                        seed: int = 0) -> Dict[str, List[dict]]:
+    """Keep every row belonging to a deterministic subset of users.
+
+    Sampling by *user* rather than by row is not a detail: GAUC and nDCG@5 are
+    both computed within a user's impression list, so tearing users apart would
+    leave one-row groups that the metrics discard, and the smoke run would report
+    a score with almost nothing behind it. Keeping whole users intact means the
+    smoke score is a small, noisy estimate of the real one rather than a
+    different quantity — good enough to catch NaNs and shape errors, which is all
+    it is for.
+    """
+    users = sorted({r['user_id'] for r in splits.get('valid', [])})
+    if len(users) > max_users:
+        rng = np.random.default_rng(seed)
+        keep = set(np.asarray(users, dtype=object)[
+            rng.permutation(len(users))[:max_users]].tolist())
+    else:
+        keep = set(users)
+    return {name: [r for r in rows if r['user_id'] in keep]
+            for name, rows in splits.items()}
 
 
 def main(argv=None) -> TrainResult:
@@ -457,23 +503,38 @@ def main(argv=None) -> TrainResult:
     splits = load_kuairand(args.data_dir, include_extra_features=args.cwm)
     print({k: len(v) for k, v in splits.items()})
 
+    if args.smoke:
+        splits = subsample_for_smoke(splits, max_users=args.smoke_users, seed=args.seed)
+        print(f"==> SMOKE MODE — {args.smoke_users} users, 1 epoch. This verifies the "
+              f"code runs; the score is not comparable to a full run.")
+        print({k: len(v) for k, v in splits.items()})
+
+    # One epoch, no early stopping, and a token forest in smoke mode. The numpy
+    # FM raises its own floors on epochs/patience to reproduce the official
+    # baseline, so it needs the override too or --smoke would still run 40 epochs.
+    epochs = 1 if args.smoke else args.epochs
+    patience = 1 if args.smoke else args.patience
+    fm_epochs = 1 if args.smoke else max(args.epochs, 40)
+    fm_patience = 1 if args.smoke else max(args.patience, 4)
+    trees = 20 if args.smoke else args.trees
+
     if args.model == 'fm':
-        return train_numpy_fm(splits, lr=args.lr or 0.001, epochs=max(args.epochs, 40),
-                              bs=args.batch_size, patience=max(args.patience, 4),
+        return train_numpy_fm(splits, lr=args.lr or 0.001, epochs=fm_epochs,
+                              bs=args.batch_size, patience=fm_patience,
                               seed=args.seed, use_cwm=args.cwm)
     if args.model == 'mmoe':
         return train_mmoe(splits, embed_dim=args.embed_dim, num_experts=args.experts,
                           expert_dim=args.expert_dim, lr=args.lr or 0.001,
-                          epochs=args.epochs, bs=args.batch_size, patience=args.patience,
+                          epochs=epochs, bs=args.batch_size, patience=patience,
                           seed=args.seed, loss=args.loss, aux_weight=args.aux_weight,
                           use_cwm=args.cwm)
     if args.model == 'lgb':
-        return train_lightgbm(splits, num_trees=args.trees, lr=args.lr or 0.05,
+        return train_lightgbm(splits, num_trees=trees, lr=args.lr or 0.05,
                               num_leaves=args.num_leaves, seed=args.seed,
                               objective=args.objective)
     return train_torch(splits, arch=args.model, loss=args.loss, embed_dim=args.embed_dim,
-                       lr=args.lr or 0.001, epochs=args.epochs, bs=args.batch_size,
-                       patience=args.patience, seed=args.seed, use_cwm=args.cwm,
+                       lr=args.lr or 0.001, epochs=epochs, bs=args.batch_size,
+                       patience=patience, seed=args.seed, use_cwm=args.cwm,
                        max_seq_len=args.max_seq_len)
 
 

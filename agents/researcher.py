@@ -27,6 +27,17 @@ class Hypothesis(BaseModel):
     mechanism: str = Field("", description="why this should move the metric")
     args: str = Field(..., description="pipeline.train arguments that test it")
 
+    #: Which mutable file implementing this would touch, and a prose sketch of
+    #: the change. Empty means "no code change needed" — a config-only trial,
+    #: which is still a legitimate experiment (a seed replicate, or running an
+    #: architecture that already exists).
+    target_file: str = ""
+    edit_sketch: str = ""
+
+    #: Who actually authored this: "llm" or "playbook". Deliberately has no
+    #: default — see the note on TrialSpec.source in agents/engineer.py.
+    source: str
+
     @field_validator("dimension")
     @classmethod
     def _known(cls, v: str) -> str:
@@ -38,6 +49,21 @@ class Hypothesis(BaseModel):
 
 class HypothesisSet(BaseModel):
     hypotheses: List[Hypothesis] = Field(..., min_length=1)
+
+
+def _stamp_source(payload: Any, source: str) -> Any:
+    """Set provenance on parsed hypotheses.
+
+    The model is never asked to declare where a hypothesis came from — it would
+    have no way to know, and a field the model fills is a field the model can
+    get wrong. Provenance is stamped by whichever code path produced it, which
+    is the only place that actually knows.
+    """
+    if isinstance(payload, dict):
+        for h in payload.get("hypotheses", []) or []:
+            if isinstance(h, dict):
+                h["source"] = source
+    return payload
 
 
 SYSTEM = """You are the ML Research scientist on an autonomous team working on the
@@ -58,7 +84,11 @@ Benchmark facts you must reason with:
 
 Trainer arguments available (`python -m pipeline.train`):
   --model       fm | fm_torch | deepfm | din | mmoe | lgb
-  --loss        pointwise | listwise | bpr      (ignored by fm and lgb)
+  --loss        pointwise | listwise | bpr
+                NOTE: `fm` (numpy) and `lgb` (LightGBM) have their own trainers
+                and IGNORE --loss completely. A hypothesis about an objective
+                must run on fm_torch, deepfm, din or mmoe, or the new loss is
+                never called and you measure the stock model instead.
   --embed_dim   16 | 32 | 64
   --experts     4 | 6 | 8           --expert_dim 64 | 96 | 128
   --aux_weight  0.1 | 0.3 | 0.5
@@ -70,6 +100,31 @@ Trainer arguments available (`python -m pipeline.train`):
 
 Every hypothesis must state a MECHANISM: the reason this change should move a
 within-user ranking metric. "It is a stronger model" is not a mechanism.
+
+WRITING CODE IS THE POINT
+The flags above only reach methods that already exist. Prefer hypotheses that
+require NEW CODE, and say where it goes:
+  target_file  pipeline/models.py    losses and architectures
+               pipeline/features.py  encoders, causal statistics, sequences
+               pipeline/train.py     optimiser, schedule, batching, early stop
+  edit_sketch  what to implement, concretely enough for an engineer to write it.
+
+Established methods worth implementing here, with the reason each suits a
+*within-user* ranking objective:
+- ApproxNDCG (Qin et al. 2010) / NeuralNDCG (Pobrotyn 2021) / LambdaLoss (Wang
+  et al. 2018): optimise a smooth surrogate of nDCG@5 directly, instead of a
+  likelihood that only correlates with it.
+- ListMLE (Xia et al. 2008): full-permutation likelihood over a user's list.
+- Focal loss (Lin et al. 2017): long_view positives are sparse; down-weight the
+  easy negatives that dominate the gradient.
+- DCN-v2 (Wang et al. 2021): explicit bounded-degree feature crosses.
+- PLE (Tang et al. 2020): separates shared from task-specific experts where
+  MMoE's shared trunk lets tasks fight.
+- User x item cross statistics in CausalStats: user-constant features cannot
+  reorder a user's list, but interactions between the user and the candidate can.
+
+Leave target_file and edit_sketch empty ONLY when the experiment genuinely needs
+no new code (a seed replicate, or a configuration of something already built).
 
 Reply with a single JSON object and nothing else."""
 
@@ -111,18 +166,24 @@ Measured dead ends:
 Propose {self.proposals} distinct experiments inside the focus dimensions, ordered
 best first. Each must differ from every configuration already run.
 
+Code already applied to the pipeline you are extending:
+  {ctx.lineage}
+
 {{
   "hypotheses": [
     {{
       "dimension": "one of the focus dimensions",
       "hypothesis": "what you are testing",
       "mechanism": "why this should move a within-user ranking metric",
+      "target_file": "pipeline/models.py, pipeline/features.py, pipeline/train.py, or \\"\\"",
+      "edit_sketch": "the code change to make, concretely; empty if none is needed",
       "args": "--model ... --loss ..."
     }}
   ]
 }}"""
 
     def _parse(self, payload: Any, ctx: ResearchContext, **kwargs) -> List[Hypothesis]:
+        payload = _stamp_source(payload, "llm")
         result = validated(HypothesisSet, payload)
         allowed = set(ctx.directive.focus_dimensions) if ctx.directive else set(DIMENSIONS)
         # Honour the directive: drop anything outside it rather than silently
@@ -138,7 +199,7 @@ best first. Each must differ from every configuration already run.
             out.append(Hypothesis(dimension=entry["dimension"],
                                   hypothesis=entry["hypothesis"],
                                   mechanism=entry["mechanism"],
-                                  args=entry["args"]))
+                                  args=entry["args"], source="playbook"))
             if len(out) >= self.proposals:
                 break
         if not out:
@@ -147,7 +208,7 @@ best first. Each must differ from every configuration already run.
                 out.append(Hypothesis(dimension=entry["dimension"],
                                       hypothesis=entry["hypothesis"],
                                       mechanism=entry["mechanism"],
-                                      args=entry["args"]))
+                                      args=entry["args"], source="playbook"))
                 if len(out) >= self.proposals:
                     break
         return out

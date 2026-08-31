@@ -1,0 +1,189 @@
+{
+  "run_id": "rankagent-20260831-005009",
+  "benchmark": "KuaiRand-Pure",
+  "baseline_valid_primary": 0.6016,
+  "baseline_reproduced": true,
+  "best_valid_primary": 0.6024,
+  "best_delta": 0.0009000000000000119,
+  "best_iteration": 1,
+  "iterations_used": 1,
+  "iteration_cap": 1,
+  "halt_reason": "reached the 1-iteration cap",
+  "wall_clock_seconds": 41.610986948013306,
+  "total_prompt_tokens": 0,
+  "total_completion_tokens": 0,
+  "llm_calls": 0,
+  "manual_interventions": 2,
+  "error_recoveries": 0,
+  "failed_iterations": 0,
+  "submission_path": "submissions/kuairand_pure_final.csv",
+  "baseline_measured": 0.6015,
+  "baseline_drift": -9.999999999998899e-05,
+  "submission_decision": {
+    "sigma": 0.0008,
+    "chosen_iteration": 1,
+    "valid_primary": 0.6024,
+    "delta_vs_baseline": 0.0009000000000000119,
+    "beat_baseline": true,
+    "runner_up_iteration": 0,
+    "runner_up_primary": 0.6015,
+    "margin": 0.0009000000000000119,
+    "margin_in_sigma": 1.1250000000000149,
+    "margin_is_significant": false,
+    "rationale": "Iteration 1 scored 0.6024 on validation, +0.0009 (1.1 sigma) ahead of iteration 0 at 0.6015. That margin is within 0.0024 (3 sigma of seed noise), so the two are not separated by this evidence; the higher validation score is used as the tie-break."
+  },
+  "interventions": [
+    {
+      "kind": "cli:--data-dir",
+      "severity": "config",
+      "detail": "operator set --data-dir=/Users/pk/Documents/GitHub/RankAgent/data/KuaiRand-Pure/data (default None)",
+      "iteration": null,
+      "at": 1788108609.006794
+    },
+    {
+      "kind": "cli:--max-iterations",
+      "severity": "config",
+      "detail": "operator set --max-iterations=1 (default None)",
+      "iteration": null,
+      "at": 1788108609.0067961
+    }
+  ],
+  "autonomy": {
+    "llm_available": false,
+    "iterations_total": 1,
+    "iterations_llm_authored": 0,
+    "iterations_from_playbook": 1,
+    "nodes_with_generated_code": 0,
+    "generated_lines_added": 0,
+    "best_node_source": "playbook",
+    "best_node_had_code_change": false,
+    "note": "This run had no usable API key: every hypothesis came from the hard-coded playbook and no code was generated. It demonstrates the harness, not autonomy."
+  },
+  "cost_by_agent": {},
+  "iterations": [
+    {
+      "iteration_id": 0,
+      "parent_node_id": null,
+      "node_id": 0,
+      "stage": "Baseline Reproduction",
+      "hypothesis": "Reproduce the organizer's FM baseline end to end",
+      "rationale": "Every later delta is measured against this run.",
+      "target_file": "pipeline/train.py",
+      "command": "/Users/pk/Documents/GitHub/RankAgent/.venv/bin/python -m pipeline.train --model fm --data_dir /Users/pk/Documents/GitHub/RankAgent/data/KuaiRand-Pure/data",
+      "proposal_source": "fallback",
+      "code_diff": "",
+      "status": "ACCEPTED",
+      "metrics": {
+        "gauc": 0.6671,
+        "ndcg_5": 0.5358,
+        "primary_score": 0.6015,
+        "delta_from_baseline": -9.999999999998899e-05,
+        "raw_stdout": "==> loading KuaiRand-Pure (train + valid; hidden test is sealed)\n{'train': 1141112, 'valid': 124909}\n  epoch  1 | loss 0.6391 | valid GAUC 0.6467 nDCG@5 0.5272 primary 0.5869 | 1.2s\n  epoch  2 | loss 0.5479 | valid GAUC 0.6589 nDCG@5 0.5323 primary 0.5956 | 1.2s\n  epoch  3 | loss 0.5129 | valid GAUC 0.6642 nDCG@5 0.5344 primary 0.5993 | 1.2s\n  epoch  4 | loss 0.5004 | valid GAUC 0.6642 nDCG@5 0.5346 primary 0.5994 | 1.2s\n  epoch  5 | loss 0.4941 | valid GAUC 0.6661 nDCG@5 0.5360 primary 0.6010 | 1.2s\n  epoch  6 | loss 0.4897 | valid GAUC 0.6658 nDCG@5 0.5354 primary 0.6006 | 1.3s\n  epoch  7 | loss 0.4859 | valid GAUC 0.6671 nDCG@5 0.5358 primary 0.6015 | 1.2s\n  epoch  8 | loss 0.4821 | valid GAUC 0.6665 nDCG@5 0.5359 primary 0.6012 | 1.2s\n  epoch  9 | loss 0.4784 | valid GAUC 0.6666 nDCG@5 0.5348 primary 0.6007 | 1.2s\n  epoch 10 | loss 0.4744 | valid GAUC 0.6650 nDCG@5 0.5342 primary 0.5996 | 1.2s\n  epoch 11 | loss 0.4705 | valid GAUC 0.6640 nDCG@5 0.5341 primary 0.5990 | 1.2s\n  early stop at epoch 11\n[EVAL] GAUC: 0.6671 | nDCG@5: 0.5358 | Primary: 0.6015\n"
+      },
+      "delta_over_baseline": -9.999999999998899e-05,
+      "error_recovery": null,
+      "agent_trace": null,
+      "prompt_tokens": 0,
+      "completion_tokens": 0,
+      "llm_calls": 0,
+      "cumulative_prompt_tokens": 0,
+      "cumulative_completion_tokens": 0,
+      "wall_clock_seconds": 19.71124815940857,
+      "manual_interventions": 0
+    },
+    {
+      "iteration_id": 1,
+      "parent_node_id": 0,
+      "node_id": 1,
+      "stage": "loss",
+      "hypothesis": "Replace pointwise BCE with a within-user listwise softmax.",
+      "rationale": "GAUC and nDCG@5 rank inside one user's impression list, so a per-impression likelihood optimises the wrong quantity. A listwise objective is invariant to per-user score offsets, exactly as the metrics are.",
+      "target_file": "(configuration only)",
+      "command": "/Users/pk/Documents/GitHub/RankAgent/.venv/bin/python -m pipeline.train --model fm_torch --loss listwise --epochs 15 --data_dir /Users/pk/Documents/GitHub/RankAgent/data/KuaiRand-Pure/data",
+      "proposal_source": "playbook",
+      "code_diff": "",
+      "status": "ACCEPTED",
+      "metrics": {
+        "gauc": 0.6685,
+        "ndcg_5": 0.5363,
+        "primary_score": 0.6024,
+        "delta_from_baseline": 0.0008000000000000229,
+        "raw_stdout": "==> loading KuaiRand-Pure (train + valid; hidden test is sealed)\n{'train': 1141112, 'valid': 124909}\n==> fm_torch | loss=listwise | dim=16 | fields=5 | cpu\n  epoch  1 | loss 3.6809 | valid GAUC 0.6622 nDCG@5 0.5331 primary 0.5976 | 0.9s\n  epoch  2 | loss 3.6248 | valid GAUC 0.6669 nDCG@5 0.5353 primary 0.6011 | 0.8s\n  epoch  3 | loss 3.6134 | valid GAUC 0.6682 nDCG@5 0.5364 primary 0.6023 | 0.8s\n  epoch  4 | loss 3.6085 | valid GAUC 0.6673 nDCG@5 0.5355 primary 0.6014 | 0.8s\n  epoch  5 | loss 3.6036 | valid GAUC 0.6685 nDCG@5 0.5363 primary 0.6024 | 0.8s\n  epoch  6 | loss 3.5978 | valid GAUC 0.6665 nDCG@5 0.5357 primary 0.6011 | 0.8s\n  epoch  7 | loss 3.5906 | valid GAUC 0.6657 nDCG@5 0.5349 primary 0.6003 | 0.8s\n  epoch  8 | loss 3.5819 | valid GAUC 0.6630 nDCG@5 0.5337 primary 0.5984 | 0.8s\n  early stop at epoch 8\n[EVAL] GAUC: 0.6685 | nDCG@5: 0.5363 | Primary: 0.6024\n"
+      },
+      "delta_over_baseline": 0.0008000000000000229,
+      "error_recovery": null,
+      "agent_trace": {
+        "directive": {
+          "phase": "explore loss",
+          "focus_dimensions": [
+            "loss",
+            "sequence"
+          ],
+          "avoid_dimensions": [],
+          "reasoning": "loss, sequence has no experiments yet; an untried axis is worth more than another variation of a tried one.",
+          "valid_for": 3
+        },
+        "hypotheses_considered": [
+          {
+            "dimension": "loss",
+            "hypothesis": "Replace pointwise BCE with a within-user listwise softmax.",
+            "mechanism": "GAUC and nDCG@5 rank inside one user's impression list, so a per-impression likelihood optimises the wrong quantity. A listwise objective is invariant to per-user score offsets, exactly as the metrics are.",
+            "args": "--model fm_torch --loss listwise --epochs 15",
+            "target_file": "",
+            "edit_sketch": "",
+            "source": "playbook"
+          },
+          {
+            "dimension": "loss",
+            "hypothesis": "Compare pairwise BPR against the listwise objective.",
+            "mechanism": "BPR optimises the pairwise ordering AUC counts directly. If GAUC dominates the primary score more than top-heavy nDCG does, it should win.",
+            "args": "--model fm_torch --loss bpr --epochs 15",
+            "target_file": "",
+            "edit_sketch": "",
+            "source": "playbook"
+          },
+          {
+            "dimension": "sequence",
+            "hypothesis": "Add target attention over the user's last 10 impressions (DIN).",
+            "mechanism": "Nothing in the baseline uses behaviour order. Attention conditioned on the candidate video should separate durable taste from incidental exposure.",
+            "args": "--model din --loss listwise --max_seq_len 10 --epochs 10",
+            "target_file": "",
+            "edit_sketch": "",
+            "source": "playbook"
+          }
+        ],
+        "chosen": {
+          "dimension": "loss",
+          "hypothesis": "Replace pointwise BCE with a within-user listwise softmax.",
+          "mechanism": "GAUC and nDCG@5 rank inside one user's impression list, so a per-impression likelihood optimises the wrong quantity. A listwise objective is invariant to per-user score offsets, exactly as the metrics are.",
+          "args": "--model fm_torch --loss listwise --epochs 15",
+          "command": "/Users/pk/Documents/GitHub/RankAgent/.venv/bin/python -m pipeline.train --model fm_torch --loss listwise --epochs 15 --data_dir /Users/pk/Documents/GitHub/RankAgent/data/KuaiRand-Pure/data",
+          "checkpoint": "fm_torch_listwise",
+          "source": "playbook",
+          "implementation": null,
+          "rejected": []
+        },
+        "rejected_by_engineer": [],
+        "preflight_problems": [],
+        "pm_refreshed": true,
+        "trace": [
+          "PM set phase 'explore loss'",
+          "Researcher proposed 3",
+          "QA pre-flight passed"
+        ],
+        "qa_verdict": {
+          "trustworthy": true,
+          "note": ""
+        }
+      },
+      "prompt_tokens": 0,
+      "completion_tokens": 0,
+      "llm_calls": 0,
+      "cumulative_prompt_tokens": 0,
+      "cumulative_completion_tokens": 0,
+      "wall_clock_seconds": 14.594006061553955,
+      "manual_interventions": 0
+    }
+  ],
+  "total_tokens": 0
+}

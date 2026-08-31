@@ -1,0 +1,11 @@
+{
+  "model": "mmoe",
+  "loss": "pointwise",
+  "embed_dim": 32,
+  "num_experts": 4,
+  "expert_dim": 64,
+  "aux_weight": 0.1,
+  "lr": 0.001,
+  "seed": 0,
+  "use_cwm": false
+}

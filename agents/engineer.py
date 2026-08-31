@@ -26,7 +26,7 @@ import contextlib
 import io
 import shlex
 import sys
-from typing import Any, List, Optional, Tuple
+from typing import Any, Iterable, List, Optional, Tuple
 
 from pydantic import BaseModel, Field
 
@@ -37,6 +37,21 @@ from agents.researcher import Hypothesis
 PY = sys.executable
 
 
+class Implementation(BaseModel):
+    """A code change actually written to a workspace, with its measured diff."""
+    target_files: List[str]
+    diff: str
+    files_changed: int = 0
+    lines_added: int = 0
+    lines_removed: int = 0
+    rounds: int = 1
+    summary: str = ""
+
+    @property
+    def is_empty(self) -> bool:
+        return self.files_changed == 0
+
+
 class TrialSpec(BaseModel):
     """A runnable experiment, bound to the hypothesis that motivated it."""
     dimension: str
@@ -45,7 +60,14 @@ class TrialSpec(BaseModel):
     args: str
     command: str
     checkpoint: Optional[str] = None
-    source: str = "llm"
+    #: Who authored the hypothesis this spec implements: "llm" or "playbook".
+    #: NO DEFAULT, deliberately. It used to default to "llm", and because the
+    #: only construction site never passed it, every iteration in every archived
+    #: run logged `proposal_source: "llm"` — including runs with no API key at
+    #: all, where the hypothesis came verbatim from a hard-coded playbook. These
+    #: logs are a deliverable, so the field has to be impossible to leave unset.
+    source: str
+    implementation: Optional[Implementation] = None
     rejected: List[str] = Field(default_factory=list)
 
 
@@ -68,14 +90,25 @@ Rules:
 Reply with a single JSON object and nothing else."""
 
 
-def validate_args(args: str) -> Tuple[bool, str]:
-    """Parse ``args`` against pipeline.train's actual parser.
+def validate_args(args: str,
+                  known_models: Optional[Iterable[str]] = None,
+                  known_losses: Optional[Iterable[str]] = None) -> Tuple[bool, str]:
+    """Parse ``args`` against pipeline.train's actual parser, then check names.
 
     Returns ``(ok, message)``. Importing the trainer is cheap: it pulls in numpy
     but neither torch nor LightGBM, which are imported lazily inside the trainers.
+
+    ``--model`` and ``--loss`` deliberately no longer carry argparse ``choices=``,
+    because a hard-coded choice list is a duplicate of the code's own registry and
+    would make a model or objective the agent *writes* unreachable from the CLI.
+    The whitelist therefore moves here, where it can be parameterised: pass
+    ``known_models`` / ``known_losses`` discovered from the node's own source to
+    accept newly registered names, or leave them ``None`` to accept only what the
+    harness ships. Either way an invented name is still caught before a trial
+    runs — the check moved, it did not disappear.
     """
     try:
-        from pipeline.train import build_parser
+        from pipeline.train import ARCHS, LOSSES_DOC, build_parser
     except Exception as exc:                       # pragma: no cover - import guard
         return False, f"could not load the trainer's argument spec: {exc}"
 
@@ -96,6 +129,16 @@ def validate_args(args: str) -> Tuple[bool, str]:
         return False, f"unrecognised arguments: {' '.join(extra)}"
     if not getattr(parsed, "model", None):
         return False, "no --model supplied"
+
+    models = set(known_models) if known_models is not None else set(ARCHS)
+    if parsed.model not in models:
+        return False, (f"unknown model {parsed.model!r}; registered: {sorted(models)}. "
+                       f"Implement and register it in the code before selecting it.")
+
+    losses = set(known_losses) if known_losses is not None else set(LOSSES_DOC)
+    if getattr(parsed, "loss", None) and parsed.loss not in losses:
+        return False, (f"unknown loss {parsed.loss!r}; registered: {sorted(losses)}. "
+                       f"Add it to pipeline/models.py LOSSES before selecting it.")
     return True, "ok"
 
 
@@ -119,10 +162,30 @@ def checkpoint_name(args: str) -> Optional[str]:
     return f"{model}_{flags.get('loss', 'listwise')}"
 
 
+#: Where a change in each research dimension most naturally lands, used when the
+#: Researcher does not name a target file.
+_DEFAULT_TARGET = {
+    "loss": "pipeline/models.py",
+    "architecture": "pipeline/models.py",
+    "sequence": "pipeline/features.py",
+    "features": "pipeline/features.py",
+    "multi_task": "pipeline/train.py",
+    "optimisation": "pipeline/train.py",
+    "capacity": "pipeline/models.py",
+}
+
+
 class EngineerAgent(Agent):
     name = "engineer"
     system_prompt = SYSTEM
     max_tokens = 500
+    #: Patches are larger than repaired flag strings and truncation here means a
+    #: wasted round trip, so the code path gets its own, roomier ceiling. It has
+    #: to fit a whole-file rewrite of models.py (~400 lines), which is the
+    #: fallback when the model cannot produce a reliable anchor.
+    code_max_tokens = 12000
+    #: Rounds the last `implement` call used, for the run log.
+    code_rounds = 0
 
     def build(self, ctx: ResearchContext, hypotheses: List[Hypothesis],
               data_dir: Optional[str] = None) -> Optional[TrialSpec]:
@@ -161,6 +224,97 @@ class EngineerAgent(Agent):
 
         return None
 
+    # -- code generation --------------------------------------------------
+
+    def implement(self, ctx: ResearchContext, ws, h: Hypothesis,
+                  max_rounds: int = 3,
+                  traceback_text: str = "") -> Tuple[Optional[Implementation], List[str]]:
+        """Write ``h`` into ``ws`` as a source patch.
+
+        Returns ``(implementation, problems)``. On failure the implementation is
+        ``None`` and ``problems`` explains why in terms the model can act on —
+        the caller either retries with a different hypothesis or prunes.
+
+        Nothing is written to the workspace until a full round of edits has
+        applied cleanly and every touched file still parses, so a failed attempt
+        leaves the node's code exactly as its parent left it.
+        """
+        from agents.codegen import SYSTEM as CODE_SYSTEM, build_prompt
+        from agents.patch import apply_all, parse_edit_blocks
+        from sandbox.workspace import MUTABLE
+
+        if self.llm is None or not self.llm.available:
+            return None, ["no LLM available to write code"]
+
+        targets = [h.target_file] if h.target_file in MUTABLE else []
+        if not targets:
+            # The Researcher did not name a file, or named one it may not touch.
+            # Infer from the dimension rather than refusing outright.
+            targets = [_DEFAULT_TARGET.get(h.dimension, "pipeline/models.py")]
+
+        before = ws.snapshot()
+        problems: List[str] = []
+        self.code_rounds = 0
+
+        for attempt in range(1, max_rounds + 1):
+            self.code_rounds = attempt
+            try:
+                reply = self.llm.complete(
+                    self.name, CODE_SYSTEM,
+                    build_prompt(h, targets, before, lineage=ctx.lineage,
+                                 problems=problems or None,
+                                 traceback_text=traceback_text),
+                    max_tokens=self.code_max_tokens, json_mode=False)
+            except Exception as exc:
+                self.last_error = f"{type(exc).__name__}: {exc}"
+                return None, [f"the model call failed: {self.last_error}"]
+
+            edits, errors = parse_edit_blocks(reply, MUTABLE)
+
+            if edits:
+                after, applied_problems = apply_all(before, edits)
+                if applied_problems:
+                    problems = errors + applied_problems
+                    continue
+            else:
+                # No anchors. Very often the model has returned the whole
+                # corrected file instead, which is a perfectly good answer we
+                # were previously discarding as malformed — it was the largest
+                # single cause of failed repairs.
+                from agents.patch import parse_whole_file
+                rewritten, whole_problems = parse_whole_file(
+                    reply, targets, {p: before[p] for p in targets if p in before})
+                if whole_problems or not rewritten:
+                    problems = errors + whole_problems
+                    continue
+                after = {**before, **rewritten}
+                self._say(f"    [ENGINEER]   accepted a whole-file rewrite of "
+                          f"{', '.join(rewritten)}")
+
+            if all(before.get(rel) == text for rel, text in after.items()):
+                problems = ["your edits produced no change to any file."]
+                continue
+
+            for rel, text in after.items():
+                if before.get(rel) != text:
+                    ws.write(rel, text)
+
+            # Diff against what this node INHERITED, not against the state the
+            # model was shown. They differ on a repair: the model sees the code
+            # it just broke, but the run log must show one change against the
+            # parent, not the repair in isolation.
+            from sandbox.workspace import unified_diff
+            base = ws.base or before
+            diff, (files, added, removed) = unified_diff(base, after)
+
+            return Implementation(
+                target_files=sorted(p for p in after if base.get(p) != after[p]),
+                diff=diff, files_changed=files, lines_added=added,
+                lines_removed=removed, rounds=attempt,
+                summary=f"{h.hypothesis[:80]}"), []
+
+        return None, problems
+
     def _validated_args(self, ctx: ResearchContext, h: Hypothesis,
                         rejected: List[str]) -> Tuple[str, bool]:
         """Validate a hypothesis's arguments, repairing once if the LLM can."""
@@ -190,7 +344,8 @@ class EngineerAgent(Agent):
             command = f"{command} --data_dir {data_dir}"
         return TrialSpec(dimension=h.dimension, hypothesis=h.hypothesis,
                          mechanism=h.mechanism, args=args, command=command,
-                         checkpoint=checkpoint_name(args), rejected=list(rejected))
+                         checkpoint=checkpoint_name(args), source=h.source,
+                         rejected=list(rejected))
 
     @staticmethod
     def _differentiate(ctx: ResearchContext, args: str) -> Optional[str]:
