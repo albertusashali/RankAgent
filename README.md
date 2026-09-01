@@ -10,15 +10,19 @@ python main.py --max_iterations 30
 
 ## 1. Project Overview
 
-The KuaiRand-Pure benchmark evaluates within-user ranking on micro-video impressions. The target task predicts `long_view` (watch-time threshold) scored via Group AUC (**GAUC**) and **nDCG@5**, with the **primary score** defined as their arithmetic mean:
+### Problem Statement & Challenge
+The **KuaiRand-Pure** benchmark evaluates within-user ranking on micro-video impressions. The target task predicts `long_view` (watch-time completion threshold) scored via Group AUC (**GAUC**) and **nDCG@5**, with the **primary score** defined as their arithmetic mean:
 
 $$\text{Primary Score} = \frac{\text{GAUC} + \text{nDCG@5}}{2}$$
 
-The official Factorization Machine (FM) baseline published by the organizers achieves **0.6016** on validation.
+Key machine learning challenges in this domain include:
+1. **Cold-Start & Extreme Sparsity**: Massive categorical cardinality across user and video IDs with sparse positive user feedback.
+2. **Watch Duration Confounding**: `long_view` is strongly influenced by video duration and post-impression watch time. Exposing raw post-impression signals on test splits causes catastrophic label leakage.
+3. **Ragged User Groupings**: Impressions vary widely per user, making standard batch pointwise objectives sub-optimal compared to true within-user listwise ranking.
+4. **Autonomous Search Surface**: Searching across 7 distinct research dimensions (loss functions, neural architectures, feature transformations, capacity, multi-task learning, sequential modeling, and optimization schedules) requires structured multi-agent collaboration rather than brute-force hyperparameter sweeps.
 
-### Architecture & Agent Roles
-
-RankAgent operates in the space of **file modifications and source patching**, not fixed hyperparameter menus. A specialized multi-agent system collaborates iteratively:
+### How RankAgent Addresses the Problem
+RankAgent replaces fixed flag menus with **direct source code generation and transactional patching**. An autonomous team of 5 specialized agents collaborates iteratively over a typed blackboard:
 
 | Role | Responsibility | Output Artefact |
 | :--- | :--- | :--- |
@@ -69,11 +73,19 @@ RankAgent operates in the space of **file modifications and source patching**, n
 ```
 
 ### Safety & Trust Boundary
-
 - **Hidden-Test Sealing**: Post-impression outcomes (`play_time_ms`, auxiliary feedback) on the test split are sealed with sentinel values (`-1`) in [`pipeline/data.py`](pipeline/data.py).
 - **Dynamic Mutation Audit**: [`pipeline/feature_agent.py`](pipeline/feature_agent.py) mutates outcome columns and verifies that feature representations remain invariant.
 - **Process Isolation**: Each trial executes in an isolated subprocess with OpenMP protection and token stripping to prevent environment leakage.
 - **Deterministic Fallback**: Every agent includes offline rule-based fallbacks, allowing full execution with zero LLM tokens.
+
+### Tools, APIs, Frameworks & Datasets Used
+
+| Category | Components Used | Purpose |
+| :--- | :--- | :--- |
+| **Development Tools** | Visual Studio Code (VSCode), Git & GitHub, PowerShell / Bash, Pytest | Local multi-file development, version control, automated test harness execution, and environment management. |
+| **APIs** | OpenAI API (GPT-4o, GPT-4o-mini), Anthropic API (Claude 3.5 Sonnet) | LLM-based reasoning, literature-grounded hypothesis formulation, transactional code authoring, and self-healing error repairs. |
+| **Libraries & Frameworks** | **PyTorch** (`torch`), **LightGBM**, **NumPy**, **SciPy**, **Scikit-Learn**, **Pandas**, **Pydantic (v2)**, **PyYAML** | Deep neural ranking models (FM, DeepFM, DIN, MMoE, DCN-v2, PLE, Cross-Attention), GBDT LambdaRank, tabular statistics, typed agent contracts, and YAML configurations. |
+| **Datasets & Assets** | **KuaiRand-Pure Dataset** (Zenodo `10439422`), **KuaiRand Starter Kit**, RecSys Knowledge Base ([`agents/knowledge.py`](agents/knowledge.py)) | 1.14M train, 125K valid, 171K sealed test impressions; official evaluation metrics; 12 citation-backed RecSys methods. |
 
 ### Benchmark Results
 
@@ -143,16 +155,17 @@ Download the official dataset archive from Zenodo and extract it into the `data/
   ```
 
 > [!NOTE]
-> The data loader in [`pipeline/data.py`](pipeline/data.py) automatically resolves the dataset whether it is located at `data/KuaiRand-Pure/data` or the nested `data/KuaiRand-Pure/KuaiRand-Pure/data`.
+> The data loader in [`pipeline/data.py`](pipeline/data.py) automatically auto-discovers the dataset whether it is located at `data/KuaiRand-Pure/data` or `data/KuaiRand-Pure/KuaiRand-Pure/data`.
 
-### 4. Configure LLM API Keys (Optional)
+### 4. Environment & API Key Configuration (`.env`)
 
-RankAgent supports both OpenAI and Anthropic models:
+> [!IMPORTANT]
+> The active `.env` file containing LLM API credentials will be **uploaded/provided privately**. Place the `.env` file directly into the repository root directory.
 
+If you are setting up your own keys manually:
 ```bash
 cp .env.example .env
 ```
-
 Edit `.env` and set your key:
 ```ini
 OPENAI_API_KEY=sk-...
