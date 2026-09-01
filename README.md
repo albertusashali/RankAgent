@@ -283,9 +283,9 @@ This project was developed by a team of 4 contributors:
 | Team Member | Core Contributions |
 | :--- | :--- |
 | **Albertus Ashali** | Initial RankAgent core framework; orchestrator state machine (`orchestrator/state_machine.py`), tree search (`orchestrator/tree_manager.py`), and intervention ledger (`orchestrator/interventions.py`); deep ranking models with dense feature interactions (PLE, DCN-v2, BST) in `pipeline/models.py`. |
-| **Goh Peck Kiat (`gohpk`)** | Multi-agent coordination (`agents/team.py`, `agents/product_manager.py`, `agents/researcher.py`, `agents/engineer.py`, `agents/qa.py`); code generation engine (`agents/codegen.py`, `agents/patch.py`); per-node sandbox workspace isolation (`sandbox/workspace.py`); verifier and subprocess runner (`sandbox/verifier.py`, `sandbox/runner.py`). |
+| **Goh Peng Kerng (`gohpk`)** | Multi-agent coordination (`agents/team.py`, `agents/product_manager.py`, `agents/researcher.py`, `agents/engineer.py`, `agents/qa.py`); code generation engine (`agents/codegen.py`, `agents/patch.py`); per-node sandbox workspace isolation (`sandbox/workspace.py`); verifier and subprocess runner (`sandbox/verifier.py`, `sandbox/runner.py`). |
 | **Brian Yeo (`brianyeo02`)** | Feature engineering pipeline (`pipeline/features.py`); feature governance and mutation-based leakage auditor (`pipeline/feature_agent.py`, `pipeline/feature_recipes.py`); Feature Steward agent integration (`agents/feature_steward.py`). |
-| **Kok Zhi (`kz`)** | Duplicate-experiment guardrail and context management (`agents/context.py`); trial execution guardrails, debugger, and error recovery (`sandbox/debugger.py`, `sandbox/logger.py`); system configuration and schema validation (`orchestrator/schemas.py`, `configs/`). |
+| **Kang Ze (`kz`)** | Duplicate-experiment guardrail and context management (`agents/context.py`); trial execution guardrails, debugger, and error recovery (`sandbox/debugger.py`, `sandbox/logger.py`); system configuration and schema validation (`orchestrator/schemas.py`, `configs/`). |
 
 ---
 
