@@ -74,3 +74,6 @@ submissions/*.csv
 !submissions/kuairand_pure_final.csv
 !submissions/sample_submission.csv
 
+# Local private documents
+WRITEUP.md
+
